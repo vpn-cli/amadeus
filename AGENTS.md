@@ -20,7 +20,7 @@ Full design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Read the section for 
 
 ## Workflow
 
-Start with a plan listing files to touch and tests to add; wait for approval. One module per task. Run `/check` before finishing. Make small, atomic Conventional Commits after each verified step (one logical change per commit; see [.agents/rules/git.md](.agents/rules/git.md)) and push verified commits promptly to `origin`.
+Start with a plan listing files to touch and tests to add; wait for approval. One module per task. Run `/check` before finishing. Make small, atomic Conventional Commits after each verified step (one logical change per commit; see [.agents/rules/git.md](.agents/rules/git.md)). Never push unless the user's prompt explicitly says to push.
 
 ## UI work
 Read DESIGN.md before any change under apps/web. One design skill per pass. Run /unslop as an audit before merging UI changes. Never hardcode colors or spacing; use the tokens in apps/web/src/styles/tokens.css.
