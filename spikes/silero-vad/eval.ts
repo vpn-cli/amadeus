@@ -26,14 +26,9 @@ import {
 
 export const FRAME_SAMPLES_20MS = 320; // Simulated WebSocket client frame size (20 ms @ 16 kHz)
 export const VAD_WINDOW_MS = (SILERO_WINDOW_SAMPLES / SILERO_SAMPLE_RATE) * 1000;
-// 550 ms hang rounded up to whole 32 ms windows: ceil(550 / 32) * 32 = 18 * 32 = 576 ms
+// 550 ms hang rounded up to whole 32 ms Silero windows = 576 ms (matches docs/ARCHITECTURE.md §7)
 export const VAD_END_BUDGET_MS =
   Math.ceil(DEFAULT_SEGMENTER_CONFIG.endSilenceMs / VAD_WINDOW_MS) * VAD_WINDOW_MS;
-
-export interface LoadedSidecarLabels {
-  labelsPath: string | null;
-  labels: GroundTruthLabel[] | null;
-}
 
 export interface WindowStepInfo {
   windowIdx: number;
@@ -52,6 +47,11 @@ export interface VadRunOutput {
   segments: DetectedSegment[];
   events: SegmenterEvent[];
   inferenceTimesMs: number[];
+}
+
+export interface LoadedSidecarLabels {
+  labelsPath: string | null;
+  labels: GroundTruthLabel[] | null;
 }
 
 export interface FileSummaryRow {
@@ -82,8 +82,8 @@ export async function resolveSidecarLabelsPath(wavPath: string): Promise<string 
 
 /**
  * Loads labels from an explicit path or `<name>.labels.txt` sidecar.
- * A missing file returns `labels: null` ("no comparison"), whereas an existing
- * 0-byte file returns `labels: []` ("labels present, zero speech").
+ * A missing labels file returns `labels: null` ("no comparison"), whereas a
+ * 0-byte labels file returns `labels: []` ("labels present, zero speech").
  */
 export async function loadSidecarLabels(
   wavPath: string,
@@ -99,9 +99,10 @@ export async function loadSidecarLabels(
 }
 
 /**
- * Compares detected segments against ground-truth labels.
+ * Compares unpadded detected segments against ground-truth labels.
  * Returns `null` when `labels === null` (missing labels file -> no comparison).
- * When `labels` is `[]` (e.g. 0-byte labels file), every detected segment is a FALSE_POSITIVE.
+ * When `labels` is `[]` (0-byte labels file -> zero speech), every detected
+ * segment is classified as a `FALSE_POSITIVE`.
  */
 export function evaluateSegments(
   segments: readonly DetectedSegment[],
