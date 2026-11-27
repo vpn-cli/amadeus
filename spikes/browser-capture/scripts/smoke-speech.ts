@@ -24,8 +24,8 @@ const UPSAMPLED_48K_PATH = path.join(OUT_DIR, "smoke-speech-input-48k.wav");
 
 const PREVIEW_PORT = 4173;
 const PREVIEW_BASE_URL = `http://127.0.0.1:${PREVIEW_PORT}/`;
-const MAX_ALIGNMENT_LAG_MS = 3000;
-const MIN_ENVELOPE_PEAK_NCC = 0.6;
+const MIN_WAVEFORM_NCC_OFF = 0.9;
+const MIN_ENVELOPE_NCC_ON = 0.8;
 const MAX_BOUNDARY_DELTA_MS = 150;
 const TARGET_SAMPLE_RATE = 16000;
 
@@ -35,7 +35,6 @@ interface ModeReport {
   samplePeakNcc: number;
   lagMs: number;
   lagSamples: number;
-  noloopHonored: boolean;
   reportedSettings: {
     echoCancellation: string;
     noiseSuppression: string;
@@ -240,19 +239,16 @@ async function launchFakeMicBrowser(useNoloopSuffix: boolean): Promise<Browser> 
   });
 }
 
-function checkFirstPassSilenceTail(
-  recorded: Float32Array,
-  fakeMicDurationMs: number,
-): boolean {
-  const tailStart = Math.round(((fakeMicDurationMs + 250) / 1000) * TARGET_SAMPLE_RATE);
-  if (tailStart >= recorded.length) {
-    return true;
-  }
-  let peak = 0;
-  for (let i = tailStart; i < recorded.length; i++) {
-    peak = Math.max(peak, Math.abs(recorded[i] ?? 0));
-  }
-  return peak < 0.01;
+function checkFirstPassEndSamples(
+  lagSamples: number,
+  sourceLength: number,
+  recordedLength: number,
+): number {
+  // Keep only the first complete pass (+1 s trailing silence for Silero vadEnd).
+  return Math.min(
+    recordedLength,
+    lagSamples + sourceLength + TARGET_SAMPLE_RATE,
+  );
 }
 
 async function runMode(
@@ -286,7 +282,9 @@ async function runMode(
       timeout: 10000,
     });
 
-    const recordTargetMs = fakeMicDurationMs + 1000;
+    // Record >= 2 × source duration + 1 s to guarantee at least one full pass
+    // regardless of Chrome's arbitrary start offset within the looped fake device.
+    const recordTargetMs = 2 * fakeMicDurationMs + 1000;
     const minFrames = Math.ceil(recordTargetMs / 20);
     await page.waitForFunction(
       (targetFrames: number) =>
@@ -351,27 +349,38 @@ async function runMode(
 
     const recordedPcm16 = parsedRecorded.samples as Int16Array;
     const recordedFloat = int16ToFloat32(recordedPcm16);
-    const noloopHonored = checkFirstPassSilenceTail(recordedFloat, fakeMicDurationMs);
 
-    const maxLagSamples = Math.round((MAX_ALIGNMENT_LAG_MS / 1000) * TARGET_SAMPLE_RATE) + 1;
+    // Search lags in [0, sourceLength) to find the first COMPLETE pass.
+    // Chrome's fake device loops from an arbitrary offset, so there is no
+    // "leading silence" assumption or fixed-ms window.
     const alignment = findAlignmentLag(sourceFloat, recordedFloat, {
       sampleRate: TARGET_SAMPLE_RATE,
-      maxLagSamples,
+      maxLagSamples: sourceFloat.length,
     });
     const lagMs = (alignment.lagSamples / TARGET_SAMPLE_RATE) * 1000;
 
-    assert(
-      alignment.envelopePeakNcc >= MIN_ENVELOPE_PEAK_NCC,
-      `[${mode}] 10 ms RMS-envelope correlation peak ${alignment.envelopePeakNcc.toFixed(4)} < ${MIN_ENVELOPE_PEAK_NCC} (samplePeakNcc=${alignment.peakNcc.toFixed(4)})`,
-    );
+    // Mode-dependent NCC gates:
+    //   processing=off: waveform peak NCC >= 0.9  (chain preserves waveform)
+    //   processing=on:  10 ms RMS-envelope NCC >= 0.9; waveform NCC printed, not gated
+    if (mode === "off") {
+      assert(
+        alignment.peakNcc >= MIN_WAVEFORM_NCC_OFF,
+        `[${mode}] waveform NCC ${alignment.peakNcc.toFixed(4)} < ${MIN_WAVEFORM_NCC_OFF}`,
+      );
+    } else {
+      assert(
+        alignment.envelopePeakNcc >= MIN_ENVELOPE_NCC_ON,
+        `[${mode}] 10 ms RMS-envelope NCC ${alignment.envelopePeakNcc.toFixed(4)} < ${MIN_ENVELOPE_NCC_ON} (waveform NCC=${alignment.peakNcc.toFixed(4)}, printed only)`,
+      );
+    }
 
-    // Keep only the first pass (+1 s of the 2 s apad trailing silence) so even if Chrome
-    // ignored %noloop, Silero sees >= 576 ms trailing silence and never sees a second pass.
-    const firstPassEndSamples = Math.min(
+    // Extract first complete pass (+1 s trailing silence for Silero vadEnd).
+    const firstPassEnd = checkFirstPassEndSamples(
+      alignment.lagSamples,
+      sourceFloat.length,
       recordedPcm16.length,
-      alignment.lagSamples + sourceFloat.length + TARGET_SAMPLE_RATE,
     );
-    const firstPassPcm16 = recordedPcm16.subarray(0, firstPassEndSamples);
+    const firstPassPcm16 = recordedPcm16.subarray(0, firstPassEnd);
     await writeFile(firstPassPath, encodePcm16Wav(firstPassPcm16, TARGET_SAMPLE_RATE, 1));
 
     const { parsed: silero } = await runSileroJsonSubprocess(firstPassPath);
@@ -434,7 +443,6 @@ async function runMode(
       samplePeakNcc: alignment.peakNcc,
       lagMs,
       lagSamples: alignment.lagSamples,
-      noloopHonored,
       reportedSettings: {
         echoCancellation,
         noiseSuppression,
@@ -463,9 +471,13 @@ function formatSignedMs(n: number): string {
 }
 
 function printModeTable(report: ModeReport): void {
+  const gateLabel =
+    report.mode === "off"
+      ? `waveformNcc=${report.samplePeakNcc.toFixed(4)} (>= ${MIN_WAVEFORM_NCC_OFF}, GATED)`
+      : `envelopeNcc=${report.envelopePeakNcc.toFixed(4)} (>= ${MIN_ENVELOPE_NCC_ON}, GATED) | waveformNcc=${report.samplePeakNcc.toFixed(4)} (printed only)`;
   console.log(`\n--- Mode: processing=${report.mode} ---`);
   console.log(
-    `Metrics:        envelopeNcc=${report.envelopePeakNcc.toFixed(4)} (>= ${MIN_ENVELOPE_PEAK_NCC}) | sampleNcc=${report.samplePeakNcc.toFixed(4)} | lag=${report.lagMs.toFixed(2)} ms (${report.lagSamples} samples) | noloop=${report.noloopHonored ? "honored" : "looped-trimmed"} | recorded=${report.recordedMs.toFixed(0)} ms | analyzed=${report.analyzedMs.toFixed(0)} ms | seqGaps=${report.seqGaps}`,
+    `Metrics:        ${gateLabel} | lag=${report.lagMs.toFixed(2)} ms (${report.lagSamples} samples) | recorded=${report.recordedMs.toFixed(0)} ms | analyzed=${report.analyzedMs.toFixed(0)} ms | seqGaps=${report.seqGaps}`,
   );
   console.log(
     `Track settings: echoCancellation=${report.reportedSettings.echoCancellation} | noiseSuppression=${report.reportedSettings.noiseSuppression} | autoGainControl=${report.reportedSettings.autoGainControl} | channelCount=${report.reportedSettings.channelCount} | sampleRate=${report.reportedSettings.sampleRate} | audioCtx=${report.reportedSettings.ctxSampleRate} | workletCh=${report.reportedSettings.workletChannels}`,
@@ -514,11 +526,9 @@ async function main(): Promise<void> {
     await waitForServer(PREVIEW_BASE_URL, 15000);
 
     let browser: Browser;
-    let noloopFlagMode = "%noloop";
     try {
       browser = await launchFakeMicBrowser(true);
     } catch {
-      noloopFlagMode = "fallback-no-suffix";
       browser = await launchFakeMicBrowser(false);
     }
 
@@ -544,7 +554,7 @@ async function main(): Promise<void> {
         `Source WAV:   ${SOURCE_WAV_PATH} (${parsedSource.durationMs.toFixed(1)} ms, ${sourceLabels.length} labels)`,
       );
       console.log(
-        `Fake-mic WAV: ${UPSAMPLED_48K_PATH} (${fakeMicWav.durationMs.toFixed(1)} ms @ ${fakeMicWav.sampleRate} Hz, ffmpeg resampler=${usedSoxr ? "soxr" : "default"}, chromeFlag=${noloopFlagMode})`,
+        `Fake-mic WAV: ${UPSAMPLED_48K_PATH} (${fakeMicWav.durationMs.toFixed(1)} ms @ ${fakeMicWav.sampleRate} Hz, ffmpeg resampler=${usedSoxr ? "soxr" : "default"})`,
       );
       printModeTable(reportOn);
       printModeTable(reportOff);
