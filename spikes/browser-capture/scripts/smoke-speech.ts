@@ -1,8 +1,8 @@
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { chromium, type Browser } from "playwright";
+import { type Browser } from "playwright";
 import { SileroRunJsonSchema, type SileroRunJson } from "../../silero-vad/json-schema.js";
 import {
   compareSegmentsToLabels,
@@ -12,6 +12,13 @@ import {
 import { findAlignmentLag } from "../src/alignment.js";
 import { int16ToFloat32 } from "../src/resampler.js";
 import { encodePcm16Wav, parseWav } from "../src/wav.js";
+import {
+  TARGET_SAMPLE_RATE,
+  assert,
+  runCaptureSession,
+  withFakeMicBrowserPreview,
+  type ReportedTrackSettings,
+} from "./capture-runner.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SPIKE_ROOT = path.resolve(__dirname, "..");
@@ -22,12 +29,9 @@ const SOURCE_LABELS_PATH = path.join(SILERO_ROOT, "out", "sample-16k.labels.txt"
 const OUT_DIR = path.join(SPIKE_ROOT, "out");
 const UPSAMPLED_48K_PATH = path.join(OUT_DIR, "smoke-speech-input-48k.wav");
 
-const PREVIEW_PORT = 4173;
-const PREVIEW_BASE_URL = `http://127.0.0.1:${PREVIEW_PORT}/`;
 const MIN_WAVEFORM_NCC_OFF = 0.9;
 const MIN_ENVELOPE_NCC_ON = 0.8;
 const MAX_BOUNDARY_DELTA_MS = 150;
-const TARGET_SAMPLE_RATE = 16000;
 
 interface ModeReport {
   mode: "on" | "off";
@@ -35,12 +39,7 @@ interface ModeReport {
   samplePeakNcc: number;
   lagMs: number;
   lagSamples: number;
-  reportedSettings: {
-    echoCancellation: string;
-    noiseSuppression: string;
-    autoGainControl: string;
-    channelCount: string;
-    sampleRate: string;
+  reportedSettings: ReportedTrackSettings & {
     ctxSampleRate: string;
     workletChannels: string;
   };
@@ -64,12 +63,6 @@ interface ModeReport {
     vadEndMs: number;
     endReason: string;
   }>;
-}
-
-function assert(condition: boolean, message: string): void {
-  if (!condition) {
-    throw new Error(`Assertion failed: ${message}`);
-  }
 }
 
 async function ensureInputsExist(): Promise<void> {
@@ -130,34 +123,6 @@ function buildFakeMicWavWithFfmpeg(inputPath: string, outputPath: string): {
   return { usedSoxr: false };
 }
 
-async function waitForServer(url: string, timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(url);
-      if (res.ok) {
-        return;
-      }
-    } catch {
-      // Server not listening yet
-    }
-    await new Promise((r) => setTimeout(r, 150));
-  }
-  throw new Error(`Timed out waiting for preview server at ${url}`);
-}
-
-function startPreviewServer(): ChildProcess {
-  const viteBin = path.join(SPIKE_ROOT, "node_modules", "vite", "bin", "vite.js");
-  return spawn(
-    process.execPath,
-    [viteBin, "preview", "--host", "127.0.0.1", "--port", String(PREVIEW_PORT), "--strictPort"],
-    {
-      cwd: SPIKE_ROOT,
-      stdio: ["ignore", "pipe", "pipe"],
-    },
-  );
-}
-
 async function runSileroJsonSubprocess(wavPath: string): Promise<{
   parsed: SileroRunJson;
   stderr: string;
@@ -211,17 +176,6 @@ async function runSileroJsonSubprocess(wavPath: string): Promise<{
   return { parsed, stderr };
 }
 
-async function launchFakeMicBrowser(): Promise<Browser> {
-  return chromium.launch({
-    headless: true,
-    args: [
-      "--use-fake-ui-for-media-stream",
-      "--use-fake-device-for-media-stream",
-      `--use-file-for-fake-audio-capture=${UPSAMPLED_48K_PATH}`,
-    ],
-  });
-}
-
 function checkFirstPassEndSamples(
   lagSamples: number,
   sourceLength: number,
@@ -236,6 +190,7 @@ function checkFirstPassEndSamples(
 
 async function runMode(
   browser: Browser,
+  previewBaseUrl: string,
   mode: "on" | "off",
   sourceFloat: Float32Array,
   sourceLabels: readonly GroundTruthLabel[],
@@ -244,216 +199,139 @@ async function runMode(
   const recordedPath = path.join(OUT_DIR, `smoke-speech-recorded-${mode}-16k.wav`);
   const firstPassPath = path.join(OUT_DIR, `smoke-speech-pass-${mode}-16k.wav`);
 
-  const context = await browser.newContext({ acceptDownloads: true });
-  const page = await context.newPage();
-  const browserErrors: string[] = [];
+  // Record >= 2 × source duration + 1 s to guarantee at least one full pass
+  // regardless of Chrome's arbitrary start offset within the looped fake device.
+  const recordTargetMs = 2 * fakeMicDurationMs + 1000;
+  const minFrames = Math.ceil(recordTargetMs / 20);
 
-  page.on("pageerror", (err) => {
-    browserErrors.push(`pageerror: ${err.message}`);
-  });
-  page.on("console", (msg) => {
-    if (msg.type() === "error") {
-      browserErrors.push(`console.error: ${msg.text()}`);
-    }
-  });
-
-  try {
-    const url = `${PREVIEW_BASE_URL}?processing=${mode}`;
-    await page.goto(url, { waitUntil: "networkidle" });
-    await page.click("#start-btn");
-    await page.waitForSelector('#status-text[data-state="recording"]', {
-      timeout: 10000,
-    });
-
-    // Record >= 2 × source duration + 1 s to guarantee at least one full pass
-    // regardless of Chrome's arbitrary start offset within the looped fake device.
-    const recordTargetMs = 2 * fakeMicDurationMs + 1000;
-    const minFrames = Math.ceil(recordTargetMs / 20);
-    await page.waitForFunction(
-      (targetFrames: number) =>
-        Number(document.getElementById("received-frames")?.textContent ?? "0") >= targetFrames,
+  const capture = await runCaptureSession({
+    browser,
+    url: `${previewBaseUrl}?processing=${mode}`,
+    outputWavPath: recordedPath,
+    stopCondition: {
+      kind: "minFrames",
       minFrames,
-      { timeout: Math.ceil(recordTargetMs) + 15000 },
-    );
+      timeoutMs: Math.ceil(recordTargetMs) + 15000,
+    },
+    label: mode,
+  });
 
-    await page.click("#stop-btn");
-    await page.waitForSelector('#status-text[data-state="stopped"]', {
-      timeout: 10000,
-    });
+  const recordedFloat = int16ToFloat32(capture.pcm16);
 
-    const ctxSampleRate = (await page.textContent("#ctx-sample-rate"))?.trim() ?? "";
-    const workletChannels = (await page.textContent("#input-channels"))?.trim() ?? "";
-    const droppedFramesText = (await page.textContent("#dropped-frames"))?.trim() ?? "-1";
-    const echoCancellation =
-      (await page.textContent("#setting-echo-cancellation"))?.trim() ?? "";
-    const noiseSuppression =
-      (await page.textContent("#setting-noise-suppression"))?.trim() ?? "";
-    const autoGainControl =
-      (await page.textContent("#setting-auto-gain-control"))?.trim() ?? "";
-    const channelCount =
-      (await page.textContent("#setting-channel-count"))?.trim() ?? "";
-    const sampleRate = (await page.textContent("#setting-sample-rate"))?.trim() ?? "";
+  // Search lags in [0, sourceLength) to find the first COMPLETE pass.
+  // Chrome's fake device loops from an arbitrary offset, so there is no
+  // "leading silence" assumption or fixed-ms window.
+  const alignment = findAlignmentLag(sourceFloat, recordedFloat, {
+    sampleRate: TARGET_SAMPLE_RATE,
+    maxLagSamples: sourceFloat.length,
+  });
+  const lagMs = (alignment.lagSamples / TARGET_SAMPLE_RATE) * 1000;
 
-    const [download] = await Promise.all([
-      page.waitForEvent("download"),
-      page.click("#download-wav-btn"),
-    ]);
-    await download.saveAs(recordedPath);
-
-    const recordedBytes = new Uint8Array(await readFile(recordedPath));
-    const parsedRecorded = parseWav(recordedBytes);
-    const seqGaps = Number(droppedFramesText);
-
+  // Mode-dependent NCC gates:
+  //   processing=off: waveform peak NCC >= 0.9  (chain preserves waveform)
+  //   processing=on:  10 ms RMS-envelope NCC >= 0.8; waveform NCC printed, not gated
+  if (mode === "off") {
     assert(
-      browserErrors.length === 0,
-      `[${mode}] Browser errors observed:\n${browserErrors.join("\n")}`,
+      alignment.peakNcc >= MIN_WAVEFORM_NCC_OFF,
+      `[${mode}] waveform NCC ${alignment.peakNcc.toFixed(4)} < ${MIN_WAVEFORM_NCC_OFF}`,
     );
+  } else {
     assert(
-      parsedRecorded.sampleRate === TARGET_SAMPLE_RATE,
-      `[${mode}] Expected ${TARGET_SAMPLE_RATE} Hz, got ${parsedRecorded.sampleRate}`,
+      alignment.envelopePeakNcc >= MIN_ENVELOPE_NCC_ON,
+      `[${mode}] 10 ms RMS-envelope NCC ${alignment.envelopePeakNcc.toFixed(4)} < ${MIN_ENVELOPE_NCC_ON} (waveform NCC=${alignment.peakNcc.toFixed(4)}, printed only)`,
     );
-    assert(
-      parsedRecorded.channels === 1,
-      `[${mode}] Expected 1 channel, got ${parsedRecorded.channels}`,
-    );
-    assert(
-      parsedRecorded.bitsPerSample === 16,
-      `[${mode}] Expected 16-bit, got ${parsedRecorded.bitsPerSample}`,
-    );
-    assert(
-      parsedRecorded.sampleCount % 320 === 0,
-      `[${mode}] Expected whole 320-sample frames, got ${parsedRecorded.sampleCount}`,
-    );
-    assert(seqGaps === 0, `[${mode}] Expected 0 seq gaps, got ${seqGaps}`);
-    assert(
-      parsedRecorded.samples instanceof Int16Array,
-      `[${mode}] Expected Int16Array samples`,
-    );
-
-    const recordedPcm16 = parsedRecorded.samples as Int16Array;
-    const recordedFloat = int16ToFloat32(recordedPcm16);
-
-    // Search lags in [0, sourceLength) to find the first COMPLETE pass.
-    // Chrome's fake device loops from an arbitrary offset, so there is no
-    // "leading silence" assumption or fixed-ms window.
-    const alignment = findAlignmentLag(sourceFloat, recordedFloat, {
-      sampleRate: TARGET_SAMPLE_RATE,
-      maxLagSamples: sourceFloat.length,
-    });
-    const lagMs = (alignment.lagSamples / TARGET_SAMPLE_RATE) * 1000;
-
-    // Mode-dependent NCC gates:
-    //   processing=off: waveform peak NCC >= 0.9  (chain preserves waveform)
-    //   processing=on:  10 ms RMS-envelope NCC >= 0.9; waveform NCC printed, not gated
-    if (mode === "off") {
-      assert(
-        alignment.peakNcc >= MIN_WAVEFORM_NCC_OFF,
-        `[${mode}] waveform NCC ${alignment.peakNcc.toFixed(4)} < ${MIN_WAVEFORM_NCC_OFF}`,
-      );
-    } else {
-      assert(
-        alignment.envelopePeakNcc >= MIN_ENVELOPE_NCC_ON,
-        `[${mode}] 10 ms RMS-envelope NCC ${alignment.envelopePeakNcc.toFixed(4)} < ${MIN_ENVELOPE_NCC_ON} (waveform NCC=${alignment.peakNcc.toFixed(4)}, printed only)`,
-      );
-    }
-
-    // Extract first complete pass (+1 s trailing silence for Silero vadEnd).
-    const firstPassEnd = checkFirstPassEndSamples(
-      alignment.lagSamples,
-      sourceFloat.length,
-      recordedPcm16.length,
-    );
-    const firstPassPcm16 = recordedPcm16.subarray(0, firstPassEnd);
-    await writeFile(firstPassPath, encodePcm16Wav(firstPassPcm16, TARGET_SAMPLE_RATE, 1));
-
-    const { parsed: silero } = await runSileroJsonSubprocess(firstPassPath);
-
-    const shiftedLabels: GroundTruthLabel[] = sourceLabels.map((lbl) => ({
-      ...lbl,
-      startMs: Math.round(lbl.startMs + lagMs),
-      endMs: Math.round(lbl.endMs + lagMs),
-    }));
-
-    const comparison = compareSegmentsToLabels(silero.segments, shiftedLabels);
-
-    assert(
-      silero.segments.length === 2,
-      `[${mode}] Expected 2 segments, got ${silero.segments.length}`,
-    );
-    for (const seg of silero.segments) {
-      assert(
-        seg.endReason === "silence",
-        `[${mode}] Expected segment #${seg.index} endReason === "silence", got "${seg.endReason}"`,
-      );
-    }
-    assert(
-      comparison.falsePositives.length === 0,
-      `[${mode}] Expected 0 false positives, got ${comparison.falsePositives.length}`,
-    );
-    assert(
-      comparison.splits.length === 0,
-      `[${mode}] Expected 0 splits, got ${comparison.splits.length}`,
-    );
-    assert(
-      comparison.missedLabels.length === 0,
-      `[${mode}] Expected 0 missed labels, got ${comparison.missedLabels.length}`,
-    );
-    assert(
-      comparison.matches.length === 2,
-      `[${mode}] Expected 2 matched labels, got ${comparison.matches.length}`,
-    );
-
-    const segmentRows = comparison.matches.map((m) => {
-      assert(
-        Math.abs(m.startDeltaMs) <= MAX_BOUNDARY_DELTA_MS,
-        `[${mode}] Segment #${m.segment.index} |startDeltaMs|=${Math.abs(m.startDeltaMs)} > ${MAX_BOUNDARY_DELTA_MS} ms`,
-      );
-      assert(
-        Math.abs(m.endDeltaMs) <= MAX_BOUNDARY_DELTA_MS,
-        `[${mode}] Segment #${m.segment.index} |endDeltaMs|=${Math.abs(m.endDeltaMs)} > ${MAX_BOUNDARY_DELTA_MS} ms`,
-      );
-      return {
-        segmentIndex: m.segment.index,
-        labelIndex: m.label.index,
-        segStartMs: m.segment.startMs,
-        segEndMs: m.segment.endMs,
-        labelStartMs: m.label.startMs,
-        labelEndMs: m.label.endMs,
-        startDeltaMs: m.startDeltaMs,
-        endDeltaMs: m.endDeltaMs,
-        onsetConfirmMs: m.segment.onsetConfirmMs,
-        vadEndMs: m.segment.vadEndMs,
-        endReason: m.segment.endReason,
-      };
-    });
-
-    return {
-      mode,
-      envelopePeakNcc: alignment.envelopePeakNcc,
-      samplePeakNcc: alignment.peakNcc,
-      lagMs,
-      lagSamples: alignment.lagSamples,
-      reportedSettings: {
-        echoCancellation,
-        noiseSuppression,
-        autoGainControl,
-        channelCount,
-        sampleRate,
-        ctxSampleRate,
-        workletChannels,
-      },
-      recordedMs: parsedRecorded.durationMs,
-      analyzedMs: (firstPassPcm16.length / TARGET_SAMPLE_RATE) * 1000,
-      seqGaps,
-      segments: silero.segments.length,
-      falsePositives: comparison.falsePositives.length,
-      splits: comparison.splits.length,
-      missedLabels: comparison.missedLabels.length,
-      segmentRows,
-    };
-  } finally {
-    await context.close();
   }
+
+  // Extract first complete pass (+1 s trailing silence for Silero vadEnd).
+  const firstPassEnd = checkFirstPassEndSamples(
+    alignment.lagSamples,
+    sourceFloat.length,
+    capture.pcm16.length,
+  );
+  const firstPassPcm16 = capture.pcm16.subarray(0, firstPassEnd);
+  await writeFile(firstPassPath, encodePcm16Wav(firstPassPcm16, TARGET_SAMPLE_RATE, 1));
+
+  const { parsed: silero } = await runSileroJsonSubprocess(firstPassPath);
+
+  const shiftedLabels: GroundTruthLabel[] = sourceLabels.map((lbl) => ({
+    ...lbl,
+    startMs: Math.round(lbl.startMs + lagMs),
+    endMs: Math.round(lbl.endMs + lagMs),
+  }));
+
+  const comparison = compareSegmentsToLabels(silero.segments, shiftedLabels);
+
+  assert(
+    silero.segments.length === 2,
+    `[${mode}] Expected 2 segments, got ${silero.segments.length}`,
+  );
+  for (const seg of silero.segments) {
+    assert(
+      seg.endReason === "silence",
+      `[${mode}] Expected segment #${seg.index} endReason === "silence", got "${seg.endReason}"`,
+    );
+  }
+  assert(
+    comparison.falsePositives.length === 0,
+    `[${mode}] Expected 0 false positives, got ${comparison.falsePositives.length}`,
+  );
+  assert(
+    comparison.splits.length === 0,
+    `[${mode}] Expected 0 splits, got ${comparison.splits.length}`,
+  );
+  assert(
+    comparison.missedLabels.length === 0,
+    `[${mode}] Expected 0 missed labels, got ${comparison.missedLabels.length}`,
+  );
+  assert(
+    comparison.matches.length === 2,
+    `[${mode}] Expected 2 matched labels, got ${comparison.matches.length}`,
+  );
+
+  const segmentRows = comparison.matches.map((m) => {
+    assert(
+      Math.abs(m.startDeltaMs) <= MAX_BOUNDARY_DELTA_MS,
+      `[${mode}] Segment #${m.segment.index} |startDeltaMs|=${Math.abs(m.startDeltaMs)} > ${MAX_BOUNDARY_DELTA_MS} ms`,
+    );
+    assert(
+      Math.abs(m.endDeltaMs) <= MAX_BOUNDARY_DELTA_MS,
+      `[${mode}] Segment #${m.segment.index} |endDeltaMs|=${Math.abs(m.endDeltaMs)} > ${MAX_BOUNDARY_DELTA_MS} ms`,
+    );
+    return {
+      segmentIndex: m.segment.index,
+      labelIndex: m.label.index,
+      segStartMs: m.segment.startMs,
+      segEndMs: m.segment.endMs,
+      labelStartMs: m.label.startMs,
+      labelEndMs: m.label.endMs,
+      startDeltaMs: m.startDeltaMs,
+      endDeltaMs: m.endDeltaMs,
+      onsetConfirmMs: m.segment.onsetConfirmMs,
+      vadEndMs: m.segment.vadEndMs,
+      endReason: m.segment.endReason,
+    };
+  });
+
+  return {
+    mode,
+    envelopePeakNcc: alignment.envelopePeakNcc,
+    samplePeakNcc: alignment.peakNcc,
+    lagMs,
+    lagSamples: alignment.lagSamples,
+    reportedSettings: {
+      ...capture.trackSettings,
+      ctxSampleRate: capture.ctxSampleRate,
+      workletChannels: capture.workletChannels,
+    },
+    recordedMs: capture.parsed.durationMs,
+    analyzedMs: (firstPassPcm16.length / TARGET_SAMPLE_RATE) * 1000,
+    seqGaps: capture.seqGaps,
+    segments: silero.segments.length,
+    falsePositives: comparison.falsePositives.length,
+    splits: comparison.splits.length,
+    missedLabels: comparison.missedLabels.length,
+    segmentRows,
+  };
 }
 
 function formatSignedMs(n: number): string {
@@ -499,26 +377,18 @@ async function main(): Promise<void> {
       parsedSource.samples instanceof Int16Array,
     `Expected 16 kHz mono PCM16 source WAV, got ${parsedSource.sampleRate} Hz, ${parsedSource.channels} ch, ${parsedSource.bitsPerSample}-bit`,
   );
-  const sourceFloat = int16ToFloat32(parsedSource.samples as Int16Array);
+  const sourceFloat = int16ToFloat32(parsedSource.samples);
   const sourceLabels = parseLabels(await readFile(SOURCE_LABELS_PATH, "utf8"));
 
   const { usedSoxr } = buildFakeMicWavWithFfmpeg(SOURCE_WAV_PATH, UPSAMPLED_48K_PATH);
   const fakeMicWav = parseWav(new Uint8Array(await readFile(UPSAMPLED_48K_PATH)));
 
-  const previewProc = startPreviewServer();
-  let previewStderr = "";
-  previewProc.stderr?.on("data", (chunk: Buffer) => {
-    previewStderr += chunk.toString();
-  });
-
-  try {
-    await waitForServer(PREVIEW_BASE_URL, 15000);
-
-    const browser = await launchFakeMicBrowser();
-
-    try {
+  await withFakeMicBrowserPreview(
+    { spikeRoot: SPIKE_ROOT, fakeMicWavPath: UPSAMPLED_48K_PATH },
+    async ({ browser, previewUrl }) => {
       const reportOn = await runMode(
         browser,
+        previewUrl,
         "on",
         sourceFloat,
         sourceLabels,
@@ -526,6 +396,7 @@ async function main(): Promise<void> {
       );
       const reportOff = await runMode(
         browser,
+        previewUrl,
         "off",
         sourceFloat,
         sourceLabels,
@@ -542,15 +413,8 @@ async function main(): Promise<void> {
       );
       printModeTable(reportOn);
       printModeTable(reportOff);
-    } finally {
-      await browser.close();
-    }
-  } finally {
-    previewProc.kill("SIGTERM");
-    if (previewStderr.trim().length > 0) {
-      console.error(previewStderr.trim());
-    }
-  }
+    },
+  );
 }
 
 main().catch((err) => {
