@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Phase 0 Spike — Browser Audio Capture</title>
+  </head>
+  <body>
+    <main>
+      <h1>Browser Capture Worklet Spike</h1>
+      <p class="subtitle">
+        Native AudioContext &rarr; streaming low-pass + fractional resampler
+        &rarr; 16 kHz mono PCM16LE (20 ms / 320-sample frames)
+      </p>
+
+      <section class="controls">
+        <button id="start-btn" type="button">Start</button>
+        <button id="stop-btn" type="button" disabled>Stop</button>
+        <button id="download-wav-btn" type="button" disabled>Download WAV</button>
+        <button id="download-raw-btn" type="button" disabled>
+          Download Raw Native WAV (Debug)
+        </button>
+        <span id="status-text" data-state="idle">Idle</span>
+      </section>
+
+      <section class="panel">
+        <h2>Audio &amp; Telemetry</h2>
+        <div class="meter-row">
+          <label for="rms-meter">RMS Level</label>
+          <progress id="rms-meter" max="1" value="0"></progress>
+          <span id="rms-db">-inf dBFS</span>
+        </div>
+
+        <dl class="stats">
+          <dt>audioContext.sampleRate</dt>
+          <dd id="ctx-sample-rate">&mdash;</dd>
+
+          <dt>Input channels (worklet)</dt>
+          <dd id="input-channels">&mdash;</dd>
+
+          <dt>Received 20 ms frames</dt>
+          <dd id="received-frames">0</dd>
+
+          <dt>Recorded audio duration</dt>
+          <dd id="recorded-duration">0 ms</dd>
+
+          <dt>Dropped frames (seq gaps)</dt>
+          <dd id="dropped-frames">0</dd>
+
+          <dt>Clock drift (expected vs received, &plusmn;2 tolerance)</dt>
+          <dd id="clock-drift">&mdash;</dd>
+        </dl>
+
+        <h3>track.getSettings()</h3>
+        <pre id="track-settings">{}</pre>
+      </section>
+
+      <section class="panel">
+        <h2>Recording Checklist</h2>
+        <p class="hint">
+          Select an item to prefill the download filename; downloaded clips are
+          marked done.
+        </p>
+        <ul id="checklist" class="checklist"></ul>
+      </section>
+
+      <pre id="error-box" hidden></pre>
+    </main>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
