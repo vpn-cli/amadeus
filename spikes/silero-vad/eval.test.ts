@@ -11,11 +11,10 @@ import type { DetectedSegment } from "./segmenter.js";
 
 function makeSeg(overrides: Partial<DetectedSegment> & { index: number; startMs: number; endMs: number }): DetectedSegment {
   return {
+    confirmedAtMs: overrides.startMs + 256,
+    decidedAtMs: overrides.endMs + 576,
     durationMs: overrides.endMs - overrides.startMs,
-    onsetMs: overrides.startMs + 300,
-    confirmMs: overrides.startMs + 556,
     onsetConfirmMs: 256,
-    detectMs: overrides.endMs + 576,
     vadEndMs: 576,
     endReason: "silence",
     ...overrides,

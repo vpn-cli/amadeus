@@ -10,7 +10,6 @@ export interface SegmenterConfig {
   offsetThreshold: number;
   minSpeechMs: number;
   endSilenceMs: number;
-  preRollMs: number;
   pendingGapMs: number;
   maxSpeechMs: number;
 }
@@ -22,7 +21,6 @@ export const DEFAULT_SEGMENTER_CONFIG: SegmenterConfig = {
   offsetThreshold: 0.35,
   minSpeechMs: 250,
   endSilenceMs: 550,
-  preRollMs: 300,
   pendingGapMs: 96,
   maxSpeechMs: 30000,
 };
@@ -31,8 +29,7 @@ export interface SpeechStartEvent {
   type: "speech_start";
   reason: SpeechStartReason;
   startMs: number;
-  onsetMs: number;
-  confirmMs: number;
+  confirmedAtMs: number;
   onsetConfirmMs: number;
 }
 
@@ -42,7 +39,7 @@ export interface SpeechEndEvent {
   startMs: number;
   endMs: number;
   durationMs: number;
-  detectMs: number;
+  decidedAtMs: number;
   vadEndMs: number;
 }
 
@@ -51,12 +48,11 @@ export type SegmenterEvent = SpeechStartEvent | SpeechEndEvent;
 export interface DetectedSegment {
   index: number;
   startMs: number;
+  confirmedAtMs: number;
   endMs: number;
+  decidedAtMs: number;
   durationMs: number;
-  onsetMs: number;
-  confirmMs: number;
   onsetConfirmMs: number;
-  detectMs: number;
   vadEndMs: number;
   endReason: SpeechEndReason;
 }
@@ -73,13 +69,14 @@ function samplesToMs(samples: number, sampleRate: number): number {
  * Pure sample-accurate hysteresis speech segmenter.
  * All internal positions and durations are tracked as integer sample counts;
  * conversion to milliseconds occurs strictly when emitting events.
+ * Emits unpadded boundaries (`startMs` = start of first positive window);
+ * pre-roll audio forwarding belongs to the downstream STT forwarding layer.
  */
 export class VadSegmenter {
   readonly config: SegmenterConfig;
 
   private readonly minSpeechSamples: number;
   private readonly endSilenceSamples: number;
-  private readonly preRollSamples: number;
   private readonly pendingGapLimitSamples: number;
   private readonly maxSpeechSamples: number;
 
@@ -87,11 +84,9 @@ export class VadSegmenter {
   private totalSamples = 0;
 
   private pendingOnsetSample = 0;
-  private backdatedStartSample = 0;
   private pendingVoicedSamples = 0;
   private pendingGapSamples = 0;
   private lastVoicedSample = 0;
-  private lastSpeechEndSample = 0;
 
   constructor(config: Partial<SegmenterConfig> = {}) {
     this.config = { ...DEFAULT_SEGMENTER_CONFIG, ...config };
@@ -102,7 +97,6 @@ export class VadSegmenter {
       offsetThreshold,
       minSpeechMs,
       endSilenceMs,
-      preRollMs,
       pendingGapMs,
       maxSpeechMs,
     } = this.config;
@@ -118,13 +112,12 @@ export class VadSegmenter {
         `Invalid thresholds: offset=${offsetThreshold}, onset=${onsetThreshold}`,
       );
     }
-    if (minSpeechMs < 0 || endSilenceMs < 0 || preRollMs < 0 || pendingGapMs < 0 || maxSpeechMs <= 0) {
+    if (minSpeechMs < 0 || endSilenceMs < 0 || pendingGapMs < 0 || maxSpeechMs <= 0) {
       throw new RangeError("Timing configuration values must be non-negative (maxSpeechMs > 0)");
     }
 
     this.minSpeechSamples = msToSamples(minSpeechMs, sampleRate);
     this.endSilenceSamples = msToSamples(endSilenceMs, sampleRate);
-    this.preRollSamples = msToSamples(preRollMs, sampleRate);
     this.pendingGapLimitSamples = msToSamples(pendingGapMs, sampleRate);
     this.maxSpeechSamples = msToSamples(maxSpeechMs, sampleRate);
   }
@@ -140,12 +133,7 @@ export class VadSegmenter {
   reset(): void {
     this.currentState = "idle";
     this.totalSamples = 0;
-    this.pendingOnsetSample = 0;
-    this.backdatedStartSample = 0;
-    this.pendingVoicedSamples = 0;
-    this.pendingGapSamples = 0;
-    this.lastVoicedSample = 0;
-    this.lastSpeechEndSample = 0;
+    this.clearPending();
   }
 
   push(probability: number): SegmenterEvent[] {
@@ -163,11 +151,6 @@ export class VadSegmenter {
       if (probability >= this.config.onsetThreshold) {
         this.currentState = "pending";
         this.pendingOnsetSample = windowStartSample;
-        this.backdatedStartSample = Math.max(
-          0,
-          this.lastSpeechEndSample,
-          windowStartSample - this.preRollSamples,
-        );
         this.pendingVoicedSamples = this.config.windowSamples;
         this.pendingGapSamples = 0;
         this.lastVoicedSample = windowEndSample;
@@ -229,9 +212,8 @@ export class VadSegmenter {
     events.push({
       type: "speech_start",
       reason: "onset",
-      startMs: samplesToMs(this.backdatedStartSample, sr),
-      onsetMs: samplesToMs(this.pendingOnsetSample, sr),
-      confirmMs: samplesToMs(windowEndSample, sr),
+      startMs: samplesToMs(this.pendingOnsetSample, sr),
+      confirmedAtMs: samplesToMs(windowEndSample, sr),
       onsetConfirmMs: samplesToMs(windowEndSample - this.pendingOnsetSample, sr),
     });
 
@@ -243,19 +225,18 @@ export class VadSegmenter {
   private emitSpeechEnd(
     reason: SpeechEndReason,
     endSample: number,
-    detectSample: number,
+    decidedAtSample: number,
   ): SpeechEndEvent {
     const sr = this.config.sampleRate;
     const event: SpeechEndEvent = {
       type: "speech_end",
       reason,
-      startMs: samplesToMs(this.backdatedStartSample, sr),
+      startMs: samplesToMs(this.pendingOnsetSample, sr),
       endMs: samplesToMs(endSample, sr),
-      durationMs: samplesToMs(endSample - this.backdatedStartSample, sr),
-      detectMs: samplesToMs(detectSample, sr),
-      vadEndMs: samplesToMs(detectSample - endSample, sr),
+      durationMs: samplesToMs(endSample - this.pendingOnsetSample, sr),
+      decidedAtMs: samplesToMs(decidedAtSample, sr),
+      vadEndMs: samplesToMs(decidedAtSample - endSample, sr),
     };
-    this.lastSpeechEndSample = endSample;
     this.clearPending();
     return event;
   }
@@ -263,7 +244,6 @@ export class VadSegmenter {
   private clearPending(): void {
     this.currentState = "idle";
     this.pendingOnsetSample = 0;
-    this.backdatedStartSample = 0;
     this.pendingVoicedSamples = 0;
     this.pendingGapSamples = 0;
     this.lastVoicedSample = 0;
@@ -281,12 +261,11 @@ export function collectSegmentsFromEvents(events: readonly SegmenterEvent[]): De
       segments.push({
         index: segments.length + 1,
         startMs: ev.startMs,
+        confirmedAtMs: activeStart.confirmedAtMs,
         endMs: ev.endMs,
+        decidedAtMs: ev.decidedAtMs,
         durationMs: ev.durationMs,
-        onsetMs: activeStart.onsetMs,
-        confirmMs: activeStart.confirmMs,
         onsetConfirmMs: activeStart.onsetConfirmMs,
-        detectMs: ev.detectMs,
         vadEndMs: ev.vadEndMs,
         endReason: ev.reason,
       });

@@ -12,7 +12,7 @@ Standalone spike validating `silero_vad.onnx` (**v6.3**, same ONNX I/O as v5) on
 ## What it tests
 1. Re-chunking incoming 20 ms (`320`-sample) 16 kHz PCM16 frames into 32 ms (`512`-sample) Silero windows.
 2. Prepending the mandatory `64`-sample rolling context tail (`[1, 576]` input) and carrying LSTM `state` (`[2, 1, 128]`) + `sr` (`16000`).
-3. Pure `VadSegmenter` (`segmenter.ts`) with integer sample tracking, `300 ms` pre-roll, `0.5` onset / `0.35` offset hysteresis, `250 ms` min speech with `96 ms` (`3` windows) pending dip tolerance, `550 ms` silence hang, `30000 ms` max utterance (`max_duration`), and explicit event `reason` fields.
+3. Pure `VadSegmenter` (`segmenter.ts`) with integer sample tracking (unpadded `startMs` at first positive window), `0.5` onset / `0.35` offset hysteresis, `250 ms` min speech with `96 ms` (`3` windows) pending dip tolerance, `550 ms` silence hang (`576 ms` at 32 ms windows), `30000 ms` max utterance (`max_duration`), and explicit event `reason` fields.
 4. Ground-truth label generation (`gen-test-wav.ps1` trimming TTS near-silence below `-50 dBFS` before concatenation) and comparison (`labels.ts`) reporting matches, splits, false positives, and missed labels.
 
 ## Run

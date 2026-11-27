@@ -96,28 +96,28 @@ function printSegmentsTable(
     const headers = [
       "#",
       "startMs",
+      "confirmedAtMs",
       "endMs",
-      "durationMs",
-      "onsetMs",
+      "decidedAtMs",
       "onsetConfirmMs",
       "vadEndMs",
       "reason",
-      ...(comparison ? ["match"] : []),
+      "match",
     ];
 
     const rows = segments.map((seg, i) => {
       const base = [
         String(seg.index),
         String(seg.startMs),
+        String(seg.confirmedAtMs),
         String(seg.endMs),
-        String(seg.durationMs),
-        String(seg.onsetMs),
+        String(seg.decidedAtMs),
         String(seg.onsetConfirmMs),
         String(seg.vadEndMs),
         seg.endReason,
       ];
       if (!comparison) {
-        return base;
+        return [...base, "n/a"];
       }
       const ann = comparison.annotations[i];
       let tag = "FALSE_POSITIVE";

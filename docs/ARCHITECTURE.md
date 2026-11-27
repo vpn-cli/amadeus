@@ -170,7 +170,7 @@ amadeus/
 
 - **State Machine (`session/reducer.ts`):**
   - `IDLE` + `START_CALL` → `LISTENING`
-  - `LISTENING` + `VAD_START` → `LISTENING` (flush 300 ms pre-roll, stream frames to STT)
+  - `LISTENING` + `VAD_START` → `LISTENING` (forward pre-roll audio from `start − 100 ms`, stream frames to STT)
   - `LISTENING` + `VAD_END` → `LISTENING` (`stt.finalize()`, mark `t_vad_end`)
   - `LISTENING` + `STT_FINAL` (empty/noise) → `LISTENING` (drop)
   - `LISTENING` + `STT_FINAL` (text) → `THINKING` (append user turn, start LLM)
@@ -180,7 +180,7 @@ amadeus/
   - `SPEAKING` + `INTERRUPT` → `LISTENING` (abort turn, commit `spoken_text` via `played_ms`, `interrupted = true`)
   - `any` + `STAGE_ERROR` → `LISTENING` (play cached fallback clip, log error)
   - `any` + `END_CALL` / `SILENCE_2MIN` / `MAX_DURATION` / `WS_CLOSE` → `ENDED`
-- **VAD Settings:** `0.5` onset / `0.35` offset hysteresis, `250 ms` min speech, `550 ms` end-of-utterance silence (configurable `500–700 ms`), `300 ms` pre-roll, `30 s` max utterance. Send Deepgram `KeepAlive` outside speech.
+- **VAD Settings:** `0.5` onset / `0.35` offset hysteresis, `250 ms` min speech, `550 ms` end-of-utterance silence (configurable `500–700 ms`), 500 ms pre-roll ring buffer; on `speech_start`, forward audio to STT from `(start − 100 ms)`. Measured `onsetConfirmMs` = 256 ms (8 × 32 ms windows), so the buffer must exceed `onsetConfirmMs` + padding. `30 s` max utterance. Send Deepgram `KeepAlive` outside speech.
 - **STT:** Deepgram Nova-3 with `interim_results=true`, `Finalize` on VAD end (plus `300 ms` settle timeout). Do not rely on Deepgram endpointing (`10 ms` default); treat `is_final` messages as fragments accumulated until VAD end.
 - **LLM & Tools:** System prompt + last 20 messages + transcript, `max_tokens ~ 150`. Max 2 tool rounds/turn with `3 s` tool timeout (`get_order_status`, `get_current_time`). Failover to Gemini only before first content token.
 - **Sentence Chunker (pure):** Split on `. ? !` + whitespace/EOS once ≥ 12 chars; ignore decimals & abbreviations (`Dr.`, `e.g.`, `etc.`, `no.`); first-clause flush on `, ; :` once ≥ 40 chars; strip markdown.
@@ -192,12 +192,12 @@ amadeus/
 
 | Stage | Measurement | Budget |
 | :--- | :--- | :--- |
-| `vad_end_ms` | Last voiced frame arrival → VAD end decision | 550 ms |
+| `vad_end_ms` | Last voiced frame arrival → VAD end decision | 576 ms (550 ms hang rounded up to whole 32 ms windows) |
 | `stt_final_ms` | VAD end → final transcript | ≤ 200 ms |
 | `llm_first_token_ms` | Final transcript → first content token | ≤ 350 ms |
 | `first_sentence_ms` | First content token → first chunk sent to TTS | ≤ 80 ms |
 | `tts_first_audio_ms` | First chunk sent to TTS → first `agent_audio` sent | ≤ 250 ms |
-| `total_ms` | Last voiced frame → first `agent_audio` sent | ≤ 1,430 ms |
+| `total_ms` | Last voiced frame → first `agent_audio` sent | ≤ 1,456 ms |
 
 ---
 
