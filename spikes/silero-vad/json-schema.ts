@@ -22,8 +22,13 @@ export const SileroParamsJsonSchema = z.object({
   maxSpeechMs: z.number().positive(),
 });
 
+export const SileroModelJsonSchema = z.object({
+  tag: z.string().min(1),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/),
+});
+
 export const SileroRunJsonSchema = z.object({
-  modelSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  model: SileroModelJsonSchema,
   params: SileroParamsJsonSchema,
   sampleRate: z.number().int().positive(),
   durationMs: z.number().nonnegative(),
@@ -32,4 +37,5 @@ export const SileroRunJsonSchema = z.object({
 
 export type SileroSegmentJson = z.infer<typeof SileroSegmentJsonSchema>;
 export type SileroParamsJson = z.infer<typeof SileroParamsJsonSchema>;
+export type SileroModelJson = z.infer<typeof SileroModelJsonSchema>;
 export type SileroRunJson = z.infer<typeof SileroRunJsonSchema>;

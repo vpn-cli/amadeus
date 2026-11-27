@@ -17,6 +17,7 @@ import {
   summarizeVadRun,
 } from "./eval.js";
 import {
+  SileroModelJsonSchema,
   SileroParamsJsonSchema,
   SileroRunJsonSchema,
   SileroSegmentJsonSchema,
@@ -27,6 +28,7 @@ import { SileroVad } from "./silero.js";
 import { readPcm16Wav } from "./wav.js";
 
 export {
+  SileroModelJsonSchema,
   SileroParamsJsonSchema,
   SileroRunJsonSchema,
   SileroSegmentJsonSchema,
@@ -139,7 +141,10 @@ async function main(): Promise<void> {
 
     if (options.json) {
       const payload: SileroRunJson = SileroRunJsonSchema.parse({
-        modelSha256: SILERO_MODEL_SHA256,
+        model: {
+          tag: SILERO_MODEL_TAG,
+          sha256: SILERO_MODEL_SHA256,
+        },
         params: {
           windowSamples: DEFAULT_SEGMENTER_CONFIG.windowSamples,
           onsetThreshold: DEFAULT_SEGMENTER_CONFIG.onsetThreshold,
@@ -159,8 +164,10 @@ async function main(): Promise<void> {
 
     const comparison = evaluateSegments(segments, labels);
     const summary = summarizeVadRun(basename(options.wavPath), segments, comparison);
-    const sorted = [...inferenceTimesMs].sort((a, b) => a - b);
-    const avg = sorted.reduce((acc, v) => acc + v, 0) / Math.max(1, sorted.length);
+    const warmupMs = inferenceTimesMs[0] ?? 0;
+    const steadySorted = inferenceTimesMs.slice(1).sort((a, b) => a - b);
+    const avg =
+      steadySorted.reduce((acc, v) => acc + v, 0) / Math.max(1, steadySorted.length);
 
     console.log("\n--- Detected Speech Segments ---");
     for (const line of renderPerSegmentErrorTable(segments, comparison)) {
@@ -181,7 +188,7 @@ async function main(): Promise<void> {
 
     console.log("\n--- Silero ONNX Inference Latency (per 32ms window) ---");
     console.log(
-      `Windows: ${sorted.length} | avg=${avg.toFixed(3)} ms | p50=${percentile(sorted, 50).toFixed(3)} ms | p95=${percentile(sorted, 95).toFixed(3)} ms | max=${(sorted[sorted.length - 1] ?? 0).toFixed(3)} ms`,
+      `Warm-up (first): ${warmupMs.toFixed(3)} ms | Rest (${steadySorted.length} windows): avg=${avg.toFixed(3)} ms | p50=${percentile(steadySorted, 50).toFixed(3)} ms | p95=${percentile(steadySorted, 95).toFixed(3)} ms | max=${(steadySorted[steadySorted.length - 1] ?? 0).toFixed(3)} ms`,
     );
   } finally {
     await vad.dispose();

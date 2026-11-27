@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import { SILERO_MODEL_SHA256 } from "./download-model.js";
+import { SILERO_MODEL_SHA256, SILERO_MODEL_TAG } from "./download-model.js";
 import { SileroRunJsonSchema } from "./json-schema.js";
 
 function runCli(args: string[]): Promise<{ code: number | null; stdout: string; stderr: string }> {
@@ -37,12 +37,15 @@ describe("silero run.ts --json CLI", () => {
 
     expect(Object.keys(parsed).sort()).toEqual([
       "durationMs",
-      "modelSha256",
+      "model",
       "params",
       "sampleRate",
       "segments",
     ]);
-    expect(parsed.modelSha256).toBe(SILERO_MODEL_SHA256);
+    expect(parsed.model).toEqual({
+      tag: SILERO_MODEL_TAG,
+      sha256: SILERO_MODEL_SHA256,
+    });
     expect(parsed.sampleRate).toBe(16000);
     expect(parsed.durationMs).toBeGreaterThan(8000);
     expect(parsed.segments).toHaveLength(2);
@@ -51,10 +54,20 @@ describe("silero run.ts --json CLI", () => {
     }
   }, 15000);
 
+  it("reports warm-up separately and excludes it from steady-state latency stats", async () => {
+    const sampleWav = resolve(import.meta.dirname, "out", "sample-16k.wav");
+    const { code, stdout, stderr } = await runCli([sampleWav]);
+
+    expect(code, `stderr: ${stderr}`).toBe(0);
+    expect(stdout).toMatch(
+      /Warm-up \(first\): \d+\.\d{3} ms \| Rest \(276 windows\): avg=\d+\.\d{3} ms \| p50=\d+\.\d{3} ms \| p95=\d+\.\d{3} ms \| max=\d+\.\d{3} ms/,
+    );
+  }, 15000);
+
   it("rejects malformed payloads via SileroRunJsonSchema", () => {
     expect(() =>
       SileroRunJsonSchema.parse({
-        modelSha256: "not-a-sha",
+        model: { tag: "", sha256: "not-a-sha" },
         params: {},
         sampleRate: 16000,
         durationMs: 100,
