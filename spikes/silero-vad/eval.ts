@@ -1,4 +1,4 @@
-import { access } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import { basename, dirname, extname, join } from "node:path";
 import { performance } from "node:perf_hooks";
 import {
@@ -6,8 +6,11 @@ import {
   type LabelComparisonResult,
   type LabelMatch,
   type SplitSegment,
+  compareSegmentsToLabels,
+  parseLabels,
 } from "./labels.js";
 import {
+  DEFAULT_SEGMENTER_CONFIG,
   type DetectedSegment,
   type SegmenterConfig,
   type SegmenterEvent,
@@ -22,6 +25,15 @@ import {
 } from "./silero.js";
 
 export const FRAME_SAMPLES_20MS = 320; // Simulated WebSocket client frame size (20 ms @ 16 kHz)
+export const VAD_WINDOW_MS = (SILERO_WINDOW_SAMPLES / SILERO_SAMPLE_RATE) * 1000;
+// 550 ms hang rounded up to whole 32 ms windows: ceil(550 / 32) * 32 = 18 * 32 = 576 ms
+export const VAD_END_BUDGET_MS =
+  Math.ceil(DEFAULT_SEGMENTER_CONFIG.endSilenceMs / VAD_WINDOW_MS) * VAD_WINDOW_MS;
+
+export interface LoadedSidecarLabels {
+  labelsPath: string | null;
+  labels: GroundTruthLabel[] | null;
+}
 
 export interface WindowStepInfo {
   windowIdx: number;
@@ -50,6 +62,8 @@ export interface FileSummaryRow {
   missedLabels: number | null;
   maxOnsetConfirmMs: number | null;
   medianVadEndMs: number | null;
+  maxVadEndMs: number | null;
+  withinVadEndBudget: boolean | null;
 }
 
 /**
@@ -64,6 +78,39 @@ export async function resolveSidecarLabelsPath(wavPath: string): Promise<string 
   } catch {
     return null;
   }
+}
+
+/**
+ * Loads labels from an explicit path or `<name>.labels.txt` sidecar.
+ * A missing file returns `labels: null` ("no comparison"), whereas an existing
+ * 0-byte file returns `labels: []` ("labels present, zero speech").
+ */
+export async function loadSidecarLabels(
+  wavPath: string,
+  explicitLabelsPath?: string | null,
+): Promise<LoadedSidecarLabels> {
+  const labelsPath =
+    explicitLabelsPath !== undefined ? explicitLabelsPath : await resolveSidecarLabelsPath(wavPath);
+  if (labelsPath === null) {
+    return { labelsPath: null, labels: null };
+  }
+  const content = await readFile(labelsPath, "utf8");
+  return { labelsPath, labels: parseLabels(content) };
+}
+
+/**
+ * Compares detected segments against ground-truth labels.
+ * Returns `null` when `labels === null` (missing labels file -> no comparison).
+ * When `labels` is `[]` (e.g. 0-byte labels file), every detected segment is a FALSE_POSITIVE.
+ */
+export function evaluateSegments(
+  segments: readonly DetectedSegment[],
+  labels: readonly GroundTruthLabel[] | null,
+): LabelComparisonResult<DetectedSegment> | null {
+  if (labels === null) {
+    return null;
+  }
+  return compareSegmentsToLabels(segments, labels);
 }
 
 export function percentile(sorted: readonly number[], p: number): number {
@@ -166,11 +213,14 @@ export function summarizeVadRun(
   file: string,
   segments: readonly DetectedSegment[],
   comparison: LabelComparisonResult<DetectedSegment> | null,
+  vadEndBudgetMs = VAD_END_BUDGET_MS,
 ): FileSummaryRow {
   const maxOnsetConfirmMs =
     segments.length === 0 ? null : Math.max(...segments.map((s) => s.onsetConfirmMs));
-  const medianVadEndMs =
-    segments.length === 0 ? null : median(segments.map((s) => s.vadEndMs));
+  const vadEndValues = segments.map((s) => s.vadEndMs);
+  const medianVadEndMs = segments.length === 0 ? null : median(vadEndValues);
+  const maxVadEndMs = segments.length === 0 ? null : Math.max(...vadEndValues);
+  const withinVadEndBudget = maxVadEndMs === null ? null : maxVadEndMs <= vadEndBudgetMs;
 
   return {
     file,
@@ -180,10 +230,38 @@ export function summarizeVadRun(
     missedLabels: comparison ? comparison.missedLabels.length : null,
     maxOnsetConfirmMs,
     medianVadEndMs,
+    maxVadEndMs,
+    withinVadEndBudget,
   };
 }
 
-export function renderCombinedSummaryTable(summaries: readonly FileSummaryRow[]): string[] {
+export function formatVadEndBudget(
+  withinBudget: boolean | null,
+  vadEndBudgetMs = VAD_END_BUDGET_MS,
+): string {
+  if (withinBudget === null) return "-";
+  return withinBudget ? `OK (<=${vadEndBudgetMs}ms)` : `OVER (>${vadEndBudgetMs}ms)`;
+}
+
+export function formatSummaryLine(
+  summary: FileSummaryRow,
+  vadEndBudgetMs = VAD_END_BUDGET_MS,
+): string {
+  const maxOnset = summary.maxOnsetConfirmMs === null ? "0" : formatNumber(summary.maxOnsetConfirmMs);
+  const medVad = summary.medianVadEndMs === null ? "0" : formatNumber(summary.medianVadEndMs);
+  const maxVad = summary.maxVadEndMs === null ? "0" : formatNumber(summary.maxVadEndMs);
+  const budget = formatVadEndBudget(summary.withinVadEndBudget, vadEndBudgetMs);
+  const splitsStr = summary.splits === null ? "n/a" : String(summary.splits);
+  const fpStr = summary.falsePositives === null ? "n/a" : String(summary.falsePositives);
+  const missedStr = summary.missedLabels === null ? "n/a" : String(summary.missedLabels);
+
+  return `Summary: segments=${summary.segments} | max onsetConfirmMs=${maxOnset} ms | median vadEndMs=${medVad} ms | max vadEndMs=${maxVad} ms | vadEndBudget=${budget} | splits=${splitsStr} | falsePositives=${fpStr} | missedLabels=${missedStr}`;
+}
+
+export function renderCombinedSummaryTable(
+  summaries: readonly FileSummaryRow[],
+  vadEndBudgetMs = VAD_END_BUDGET_MS,
+): string[] {
   const headers = [
     "file",
     "segments",
@@ -192,6 +270,8 @@ export function renderCombinedSummaryTable(summaries: readonly FileSummaryRow[])
     "missedLabels",
     "max onsetConfirmMs",
     "median vadEndMs",
+    "max vadEndMs",
+    "vadEndBudget",
   ];
 
   const rows = summaries.map((s) => [
@@ -202,6 +282,8 @@ export function renderCombinedSummaryTable(summaries: readonly FileSummaryRow[])
     s.missedLabels === null ? "n/a" : String(s.missedLabels),
     s.maxOnsetConfirmMs === null ? "-" : formatNumber(s.maxOnsetConfirmMs),
     s.medianVadEndMs === null ? "-" : formatNumber(s.medianVadEndMs),
+    s.maxVadEndMs === null ? "-" : formatNumber(s.maxVadEndMs),
+    formatVadEndBudget(s.withinVadEndBudget, vadEndBudgetMs),
   ]);
 
   return renderTable(headers, rows);
@@ -217,8 +299,9 @@ function buildSegmentErrorRow(
   const base = [
     String(seg.index),
     String(seg.startMs),
+    String(seg.confirmedAtMs),
     String(seg.endMs),
-    String(seg.durationMs),
+    String(seg.decidedAtMs),
     String(seg.onsetConfirmMs),
     String(seg.vadEndMs),
     seg.endReason,
@@ -288,8 +371,9 @@ export function renderPerSegmentErrorTable(
     const headers = [
       "#",
       "startMs",
+      "confirmedAtMs",
       "endMs",
-      "durationMs",
+      "decidedAtMs",
       "onsetConfirmMs",
       "vadEndMs",
       "reason",
@@ -320,4 +404,58 @@ export function renderPerSegmentErrorTable(
   }
 
   return lines;
+}
+
+export function renderLabelComparisonTable(
+  labels: readonly GroundTruthLabel[],
+  comparison: LabelComparisonResult<DetectedSegment>,
+): string[] {
+  const matchByLabelIdx = new Map(comparison.matches.map((m) => [m.label.index, m]));
+  const splitCountByLabelIdx = new Map<number, number>();
+  for (const s of comparison.splits) {
+    splitCountByLabelIdx.set(s.label.index, (splitCountByLabelIdx.get(s.label.index) ?? 0) + 1);
+  }
+
+  const headers = [
+    "#",
+    "startMs",
+    "endMs",
+    "durationMs",
+    "status",
+    "seg#",
+    "startDeltaMs",
+    "endDeltaMs",
+    "text",
+  ];
+  const rows = labels.map((label) => {
+    const m = matchByLabelIdx.get(label.index);
+    const splitCount = splitCountByLabelIdx.get(label.index) ?? 0;
+    if (!m) {
+      return [
+        String(label.index),
+        String(label.startMs),
+        String(label.endMs),
+        String(label.durationMs),
+        "MISSED",
+        "-",
+        "-",
+        "-",
+        label.text,
+      ];
+    }
+    const status = splitCount > 0 ? `MATCH (splits=${splitCount})` : "MATCH";
+    return [
+      String(label.index),
+      String(label.startMs),
+      String(label.endMs),
+      String(label.durationMs),
+      status,
+      String(m.segment.index),
+      formatSigned(m.startDeltaMs),
+      formatSigned(m.endDeltaMs),
+      label.text,
+    ];
+  });
+
+  return renderTable(headers, rows);
 }

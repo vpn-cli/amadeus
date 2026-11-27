@@ -1,4 +1,4 @@
-import { readdir, readFile } from "node:fs/promises";
+import { readdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
   DEFAULT_MODEL_PATH,
@@ -8,18 +8,14 @@ import {
 } from "./download-model.js";
 import {
   type FileSummaryRow,
+  evaluateSegments,
+  loadSidecarLabels,
   renderCombinedSummaryTable,
   renderPerSegmentErrorTable,
-  resolveSidecarLabelsPath,
   runVadOnSamples,
   summarizeVadRun,
 } from "./eval.js";
-import {
-  type GroundTruthLabel,
-  type LabelComparisonResult,
-  compareSegmentsToLabels,
-  parseLabels,
-} from "./labels.js";
+import type { GroundTruthLabel, LabelComparisonResult } from "./labels.js";
 import type { DetectedSegment } from "./segmenter.js";
 import { SileroVad } from "./silero.js";
 import { readPcm16Wav } from "./wav.js";
@@ -91,11 +87,10 @@ async function main(): Promise<void> {
     for (const file of wavFiles) {
       const wavPath = join(fixturesDir, file);
       const wav = await readPcm16Wav(wavPath);
-      const labelsPath = await resolveSidecarLabelsPath(wavPath);
-      const labels = labelsPath ? parseLabels(await readFile(labelsPath, "utf8")) : null;
+      const { labelsPath, labels } = await loadSidecarLabels(wavPath);
 
       const { segments } = await runVadOnSamples(vad, wav.float32);
-      const comparison = labels ? compareSegmentsToLabels(segments, labels) : null;
+      const comparison = evaluateSegments(segments, labels);
       const summary = summarizeVadRun(file, segments, comparison);
 
       results.push({
