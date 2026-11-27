@@ -24,3 +24,6 @@ Start with a plan listing files to touch and tests to add; wait for approval. On
 
 ## UI work
 Read DESIGN.md before any change under apps/web. One design skill per pass. Run /unslop as an audit before merging UI changes. Never hardcode colors or spacing; use the tokens in apps/web/src/styles/tokens.css.
+
+## Handoff
+At the end of every task, append your final report to handoff/antigravity-log.md: date, task, commit hash, key verification output (test counts, tables, measured numbers), and open issues or skipped items. Never rewrite earlier entries.
