@@ -29,3 +29,6 @@ spikes/**/*.onnx
 # OS / Editor
 .DS_Store
 Thumbs.db
+
+# Local assignment brief
+Technical Assignment.pdf
