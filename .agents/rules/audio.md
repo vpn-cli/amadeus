@@ -1,7 +1,7 @@
 ---
 trigger: glob
 globs: "apps/web/src/audio/**, apps/server/src/vad/**, packages/audio/**, spikes/**"
-description: "Pinned audio sample rates, frame sizes, binary headers, and Silero VAD v5 ONNX tensor contract."
+description: "Pinned audio sample rates, frame sizes, binary headers, and Silero VAD v6.3 ONNX tensor contract."
 ---
 
 # Audio & VAD Contracts
@@ -9,7 +9,7 @@ description: "Pinned audio sample rates, frame sizes, binary headers, and Silero
 - **Client → Server:** PCM16LE, mono, `16,000 Hz`, `20 ms` frames (`320` samples = `640` bytes), raw binary WS payload.
   - Capture in an `AudioWorklet` at the native `AudioContext` rate and downsample (e.g., `48 kHz → 16 kHz`) with a low-pass filter implemented as a pure function in `packages/audio`.
   - Mic constraints: `echoCancellation: true`, `noiseSuppression: true`, `autoGainControl: true`.
-- **Server VAD (Silero VAD v5 ONNX):**
+- **Server VAD (Silero VAD v6.3 — same ONNX I/O as v5: [1,576] input with 64-sample context, [2,1,128] state, int64 sr):**
   - Re-chunk incoming 16 kHz audio into `512`-sample windows (`32 ms`).
   - Pass `input` of shape `[1, 576]` (`64` context samples from the end of the previous frame + `512` new samples, normalized `Float32` in `[-1, 1]`), `state` of shape `[2, 1, 128]` (`float32`, initialized to zeros), and `sr` (`16000`, `int64` `[1]` or scalar per model metadata).
   - Carry over `stateN` → `state` and slice the last `64` samples of `input` as the next frame's context tail.

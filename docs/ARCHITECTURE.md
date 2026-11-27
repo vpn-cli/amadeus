@@ -39,7 +39,7 @@ Must pass all 10 acceptance criteria from §7 of the spec:
 | Language | TypeScript (strict), Node 22+ (tested on Node 24), pnpm workspaces | Shared protocol schemas between client, server, and bench |
 | Server | Fastify + `@fastify/websocket` (`ws`), `pino` logs | Typed routes and structured logs with `session_id` / `turn_id` |
 | Client | Vite + React + Tailwind, AudioWorklets | Lightweight SPA; sample-accurate capture and playback |
-| Server VAD | Silero VAD v5 ONNX via `onnxruntime-node` (~120-line wrapper) | Spec requires server-side VAD; `vad-node` is deprecated |
+| Server VAD | Silero VAD v6.3 (same ONNX I/O as v5: [1,576] input with 64-sample context, [2,1,128] state, int64 sr) ONNX via `onnxruntime-node` (~120-line wrapper) | Spec requires server-side VAD; `vad-node` is deprecated |
 | Client VAD | `@ricky0123/vad-web` | Local barge-in detection avoids network RTT before stopping playback |
 | STT (streaming) | Deepgram Nova-3 live WebSocket | Interim results for live captions + `Finalize` for fast final transcript |
 | STT (batch) | Groq `whisper-large-v3-turbo` | Used for initial non-streaming milestone and provider-swap proof |
@@ -70,7 +70,7 @@ flowchart LR
   subgraph Server["Node + Fastify + ws"]
     WS["WS Gateway\nZod-validated events"]
     Reducer["Session Reducer (pure)\nstate · timeouts"]
-    Silero["Silero VAD v5\nonnxruntime-node"]
+    Silero["Silero VAD v6.3 (same ONNX I/O as v5: [1,576] input with 64-sample context, [2,1,128] state, int64 sr)\nonnxruntime-node"]
     STT["STT Adapter\nDeepgram Nova-3 / Batch"]
     Turn["Turn Controller\nAbortController per turn"]
     LLM["LLM Adapter\nGroq -> Gemini failover"]
@@ -143,7 +143,7 @@ amadeus/
 
 ### 5.1 Audio Formats
 - **Client → Server:** `PCM16LE`, mono, `16 kHz`, `20 ms` frames (`320` samples = `640` bytes), raw binary WS messages. Capture uses native `AudioContext` rate with low-pass downsample (`48k -> 16k`) in `packages/audio`. Mic constraints: `echoCancellation`, `noiseSuppression`, `autoGainControl` = `true`.
-- **Server VAD (Silero v5):** Re-chunked into `512`-sample windows (`32 ms` at 16 kHz). Each ONNX inference call prepends `64` context samples from the end of the previous frame (shape `[1, 576]`), alongside `state` (`[2, 1, 128]`, float32) and `sr` (`16000`, int64).
+- **Server VAD (Silero VAD v6.3 — same ONNX I/O as v5: [1,576] input with 64-sample context, [2,1,128] state, int64 sr):** Re-chunked into `512`-sample windows (`32 ms` at 16 kHz). Each ONNX inference call prepends `64` context samples from the end of the previous frame (shape `[1, 576]`), alongside `state` (`[2, 1, 128]`, float32) and `sr` (`16000`, int64).
 - **Server → Client:** `PCM16LE`, mono, `24 kHz`, prefixed by a `9-byte` header: `u8 kind=1 · u32 turn_id · u32 seq` (big/little endian pinned in `packages/protocol`). Playback uses a dedicated `AudioContext({ sampleRate: 24000 })`.
 
 ### 5.2 WebSocket Events (`packages/protocol`)
@@ -225,7 +225,7 @@ amadeus/
 ## 10. Phased Roadmap (Self-Paced)
 
 - **Phase 0 — Spikes (`spikes/`):** Standalone throwaway scripts to isolate each API/runtime before integrating:
-  1. Silero VAD v5 ONNX in Node (`onnxruntime-node` + `512 + 64` context + `state`).
+  1. Silero VAD v6.3 (same ONNX I/O as v5: [1,576] input with 64-sample context, [2,1,128] state, int64 sr) ONNX in Node (`onnxruntime-node` + `512 + 64` context + `state`).
   2. Browser mic capture worklet → WAV download.
   3. Deepgram Nova-3 live WS transcription of a WAV.
   4. Groq streaming tokens + 1 tool call.

@@ -2,7 +2,7 @@ import * as ort from "onnxruntime-node";
 
 export const SILERO_SAMPLE_RATE = 16000;
 export const SILERO_WINDOW_SAMPLES = 512; // 32 ms at 16 kHz
-export const SILERO_CONTEXT_SAMPLES = 64; // v5 rolling context tail
+export const SILERO_CONTEXT_SAMPLES = 64; // v6.3 rolling context tail (same ONNX I/O as v5)
 const STATE_SIZE = 2 * 1 * 128;
 
 export class SileroVad {
@@ -17,8 +17,7 @@ export class SileroVad {
   private constructor(session: ort.InferenceSession) {
     this.session = session;
     this.state = new ort.Tensor("float32", new Float32Array(STATE_SIZE), [2, 1, 128]);
-    // Silero v5 ONNX expects scalar int64 or [1] int64 depending on export;
-    // initialized cleanly after verifying metadata or scalar BigInt64Array.
+    // Silero v6.3 ONNX (same I/O as v5) expects scalar int64 sr tensor ([])
     this.srTensor = new ort.Tensor("int64", BigInt64Array.from([BigInt(SILERO_SAMPLE_RATE)]), []);
   }
 
