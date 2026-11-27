@@ -7,6 +7,7 @@
     "model": "tsx download-model.ts",
     "test-wav": "powershell -ExecutionPolicy Bypass -File ./gen-test-wav.ps1",
     "start": "tsx run.ts",
+    "vad:all": "tsx run-all.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },

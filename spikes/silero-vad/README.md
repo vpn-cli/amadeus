@@ -24,6 +24,7 @@ pnpm test       # pure unit tests for segmenter.ts and labels.ts (Vitest, no ONN
 pnpm model      # downloads pinned v6.3 silero_vad.onnx into out/, verifies SHA-256, prints metadata
 pnpm test-wav   # generates out/sample-16k.wav + trimmed out/sample-16k.labels.txt
 pnpm start      # runs Silero VAD across out/sample-16k.wav (auto-loads out/sample-16k.labels.txt)
+pnpm vad:all    # runs Silero VAD across fixtures/audio/*.wav and prints summary + per-segment error tables
 ```
 
 ## Verified Gotchas (Node v24.15.0 + Windows)
