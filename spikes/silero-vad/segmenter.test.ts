@@ -255,4 +255,62 @@ describe("VadSegmenter", () => {
     const seg = new VadSegmenter();
     expect(() => seg.push(Number.NaN)).toThrow(RangeError);
   });
+
+  it("bridges a short dip during speaking (< endSilenceMs) without splitting", () => {
+    // 10 silent (320 ms) + 10 speech (320 ms) + 17 dip (544 ms < 550 ms) + 6 speech + 18 silent (576 ms)
+    const probs = [
+      ...repeat(0.05, 10),
+      ...repeat(0.9, 10),
+      ...repeat(0.1, 17),
+      ...repeat(0.9, 6),
+      ...repeat(0.05, 18),
+    ];
+    const { segments } = segmentProbabilities(probs);
+
+    expect(segments).toHaveLength(1);
+    expect(segments[0]).toMatchObject({
+      startMs: 320,
+      confirmedAtMs: 576,
+      endMs: 1376, // (10 + 10 + 17 + 6) * 32
+      decidedAtMs: 1952,
+      endReason: "silence",
+    });
+  });
+
+  it("handles hysteresis oscillation between offsetThreshold and onsetThreshold", () => {
+    // From idle: oscillating between 0.35 and 0.49 never reaches onsetThreshold (0.5)
+    const idleOsc = Array.from({ length: 10 }, () => [0.36, 0.49, 0.35, 0.48]).flat();
+    expect(segmentProbabilities(idleOsc)).toEqual({ events: [], segments: [] });
+
+    // Once speaking: oscillating inside [0.35, 0.49] for > 550 ms keeps speech alive
+    const speakingOsc = [
+      ...repeat(0.05, 10),
+      ...repeat(0.85, 8),
+      ...Array.from({ length: 4 }, () => [0.35, 0.49, 0.38, 0.46, 0.36, 0.47]).flat(),
+      ...repeat(0.05, 18),
+    ];
+    const { segments } = segmentProbabilities(speakingOsc);
+
+    expect(segments).toHaveLength(1);
+    expect(segments[0]).toMatchObject({
+      startMs: 320,
+      confirmedAtMs: 576,
+      endMs: 1344, // (10 + 8 + 24) * 32
+      decidedAtMs: 1920,
+      endReason: "silence",
+    });
+  });
+
+  it("produces zero events and zero segments on noise-only sub-onset input", () => {
+    const noise = Array.from({ length: 20 }, () => [0.02, 0.15, 0.33, 0.48, 0.25, 0.41]).flat();
+    const seg = new VadSegmenter();
+    const events: SegmenterEvent[] = [];
+    for (const p of noise) {
+      events.push(...seg.push(p));
+    }
+    events.push(...seg.flush());
+
+    expect(events).toEqual([]);
+    expect(seg.state).toBe("idle");
+  });
 });
