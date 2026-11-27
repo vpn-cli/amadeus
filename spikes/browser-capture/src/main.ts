@@ -1,6 +1,7 @@
 import "./style.css";
 import type { WorkletOutboundMessage } from "./capture.worklet";
 import captureWorkletUrl from "./capture.worklet.ts?worker&url";
+import { formatReportedTrackSettings, isAudioProcessingEnabled } from "./processing";
 import { encodeFloat32Wav, encodePcm16Wav } from "./wav";
 
 interface ChecklistItem {
@@ -32,6 +33,7 @@ const CHECKLIST_ITEMS: ChecklistItem[] = [
 const TARGET_SAMPLE_RATE = 16000;
 const FRAME_MS = 20;
 const CLOCK_DRIFT_TOLERANCE_FRAMES = 2;
+const AUDIO_PROCESSING_ENABLED = isAudioProcessingEnabled(window.location.search);
 
 const startBtn = document.getElementById("start-btn") as HTMLButtonElement;
 const stopBtn = document.getElementById("stop-btn") as HTMLButtonElement;
@@ -52,6 +54,24 @@ const recordedDurationEl = document.getElementById(
 ) as HTMLElement;
 const droppedFramesEl = document.getElementById("dropped-frames") as HTMLElement;
 const clockDriftEl = document.getElementById("clock-drift") as HTMLElement;
+const processingRequestedEl = document.getElementById(
+  "processing-requested",
+) as HTMLElement;
+const settingEchoCancellationEl = document.getElementById(
+  "setting-echo-cancellation",
+) as HTMLElement;
+const settingNoiseSuppressionEl = document.getElementById(
+  "setting-noise-suppression",
+) as HTMLElement;
+const settingAutoGainControlEl = document.getElementById(
+  "setting-auto-gain-control",
+) as HTMLElement;
+const settingChannelCountEl = document.getElementById(
+  "setting-channel-count",
+) as HTMLElement;
+const settingSampleRateEl = document.getElementById(
+  "setting-sample-rate",
+) as HTMLElement;
 const trackSettingsEl = document.getElementById("track-settings") as HTMLElement;
 const checklistEl = document.getElementById("checklist") as HTMLUListElement;
 const errorBoxEl = document.getElementById("error-box") as HTMLPreElement;
@@ -170,6 +190,12 @@ function resetCaptureBuffers(): void {
   recordedDurationEl.textContent = "0 ms";
   droppedFramesEl.textContent = "0";
   clockDriftEl.textContent = "—";
+  settingEchoCancellationEl.textContent = "—";
+  settingNoiseSuppressionEl.textContent = "—";
+  settingAutoGainControlEl.textContent = "—";
+  settingChannelCountEl.textContent = "—";
+  settingSampleRateEl.textContent = "—";
+  trackSettingsEl.textContent = "{}";
 }
 
 async function cleanupAudioGraph(): Promise<void> {
@@ -250,20 +276,24 @@ startBtn.addEventListener("click", async () => {
 
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
+        echoCancellation: AUDIO_PROCESSING_ENABLED,
+        noiseSuppression: AUDIO_PROCESSING_ENABLED,
+        autoGainControl: AUDIO_PROCESSING_ENABLED,
         channelCount: 1,
       },
     });
     mediaStream = stream;
 
     const audioTrack = stream.getAudioTracks()[0];
-    trackSettingsEl.textContent = JSON.stringify(
-      audioTrack?.getSettings() ?? {},
-      null,
-      2,
-    );
+    const trackSettings = audioTrack?.getSettings();
+    console.log("track.getSettings()", trackSettings ?? {});
+    const reported = formatReportedTrackSettings(trackSettings);
+    settingEchoCancellationEl.textContent = reported.echoCancellation;
+    settingNoiseSuppressionEl.textContent = reported.noiseSuppression;
+    settingAutoGainControlEl.textContent = reported.autoGainControl;
+    settingChannelCountEl.textContent = reported.channelCount;
+    settingSampleRateEl.textContent = reported.sampleRate;
+    trackSettingsEl.textContent = JSON.stringify(trackSettings ?? {}, null, 2);
 
     await ctx.audioWorklet.addModule(captureWorkletUrl);
 
@@ -369,4 +399,5 @@ downloadRawBtn.addEventListener("click", () => {
   triggerWavDownload(wav, rawName);
 });
 
+processingRequestedEl.textContent = AUDIO_PROCESSING_ENABLED ? "on" : "off";
 renderChecklist();
