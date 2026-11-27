@@ -62,6 +62,7 @@ interface ModeReport {
     endDeltaMs: number;
     onsetConfirmMs: number;
     vadEndMs: number;
+    endReason: string;
   }>;
 }
 
@@ -127,20 +128,6 @@ function buildFakeMicWavWithFfmpeg(inputPath: string, outputPath: string): {
     );
   }
   return { usedSoxr: false };
-}
-
-function runViteBuild(): void {
-  const viteBin = path.join(SPIKE_ROOT, "node_modules", "vite", "bin", "vite.js");
-  const res = spawnSync(process.execPath, [viteBin, "build"], {
-    cwd: SPIKE_ROOT,
-    encoding: "utf8",
-  });
-  if (res.error) {
-    throw new Error(`Failed to run vite build: ${res.error.message}`);
-  }
-  if (res.status !== 0) {
-    throw new Error(`vite build failed:\n${res.stderr || res.stdout}`);
-  }
 }
 
 async function waitForServer(url: string, timeoutMs: number): Promise<void> {
@@ -224,17 +211,13 @@ async function runSileroJsonSubprocess(wavPath: string): Promise<{
   return { parsed, stderr };
 }
 
-async function launchFakeMicBrowser(useNoloopSuffix: boolean): Promise<Browser> {
-  const captureArg = useNoloopSuffix
-    ? `--use-file-for-fake-audio-capture=${UPSAMPLED_48K_PATH}%noloop`
-    : `--use-file-for-fake-audio-capture=${UPSAMPLED_48K_PATH}`;
-
+async function launchFakeMicBrowser(): Promise<Browser> {
   return chromium.launch({
     headless: true,
     args: [
       "--use-fake-ui-for-media-stream",
       "--use-fake-device-for-media-stream",
-      captureArg,
+      `--use-file-for-fake-audio-capture=${UPSAMPLED_48K_PATH}`,
     ],
   });
 }
@@ -397,6 +380,12 @@ async function runMode(
       silero.segments.length === 2,
       `[${mode}] Expected 2 segments, got ${silero.segments.length}`,
     );
+    for (const seg of silero.segments) {
+      assert(
+        seg.endReason === "silence",
+        `[${mode}] Expected segment #${seg.index} endReason === "silence", got "${seg.endReason}"`,
+      );
+    }
     assert(
       comparison.falsePositives.length === 0,
       `[${mode}] Expected 0 false positives, got ${comparison.falsePositives.length}`,
@@ -434,6 +423,7 @@ async function runMode(
         endDeltaMs: m.endDeltaMs,
         onsetConfirmMs: m.segment.onsetConfirmMs,
         vadEndMs: m.segment.vadEndMs,
+        endReason: m.segment.endReason,
       };
     });
 
@@ -485,13 +475,13 @@ function printModeTable(report: ModeReport): void {
   console.log(
     `VAD summary:    segments=${report.segments} | FP=${report.falsePositives} | splits=${report.splits} | missed=${report.missedLabels}`,
   );
-  console.log("seg# | label# | seg [start, end] ms | shifted label [start, end] ms | startDeltaMs | endDeltaMs | onsetMs | vadEndMs");
-  console.log("-----+--------+---------------------+-------------------------------+--------------+------------+---------+---------");
+  console.log("seg# | label# | seg [start, end] ms | shifted label [start, end] ms | startDeltaMs | endDeltaMs | onsetMs | vadEndMs | reason");
+  console.log("-----+--------+---------------------+-------------------------------+--------------+------------+---------+----------+--------");
   for (const r of report.segmentRows) {
     const segSpan = `[${r.segStartMs}, ${r.segEndMs}]`.padEnd(19);
     const lblSpan = `[${r.labelStartMs}, ${r.labelEndMs}]`.padEnd(29);
     console.log(
-      `${String(r.segmentIndex).padEnd(4)} | ${String(r.labelIndex).padEnd(6)} | ${segSpan} | ${lblSpan} | ${formatSignedMs(r.startDeltaMs).padEnd(12)} | ${formatSignedMs(r.endDeltaMs).padEnd(10)} | ${String(r.onsetConfirmMs).padEnd(7)} | ${r.vadEndMs}`,
+      `${String(r.segmentIndex).padEnd(4)} | ${String(r.labelIndex).padEnd(6)} | ${segSpan} | ${lblSpan} | ${formatSignedMs(r.startDeltaMs).padEnd(12)} | ${formatSignedMs(r.endDeltaMs).padEnd(10)} | ${String(r.onsetConfirmMs).padEnd(7)} | ${String(r.vadEndMs).padEnd(8)} | ${r.endReason}`,
     );
   }
 }
@@ -515,7 +505,6 @@ async function main(): Promise<void> {
   const { usedSoxr } = buildFakeMicWavWithFfmpeg(SOURCE_WAV_PATH, UPSAMPLED_48K_PATH);
   const fakeMicWav = parseWav(new Uint8Array(await readFile(UPSAMPLED_48K_PATH)));
 
-  runViteBuild();
   const previewProc = startPreviewServer();
   let previewStderr = "";
   previewProc.stderr?.on("data", (chunk: Buffer) => {
@@ -525,12 +514,7 @@ async function main(): Promise<void> {
   try {
     await waitForServer(PREVIEW_BASE_URL, 15000);
 
-    let browser: Browser;
-    try {
-      browser = await launchFakeMicBrowser(true);
-    } catch {
-      browser = await launchFakeMicBrowser(false);
-    }
+    const browser = await launchFakeMicBrowser();
 
     try {
       const reportOn = await runMode(

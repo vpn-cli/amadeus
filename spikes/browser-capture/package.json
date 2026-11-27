@@ -9,8 +9,8 @@
     "preview": "vite preview --host 127.0.0.1",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "smoke": "tsx scripts/smoke.ts",
-    "smoke:speech": "tsx scripts/smoke-speech.ts"
+    "smoke": "vite build && tsx scripts/smoke.ts",
+    "smoke:speech": "vite build && tsx scripts/smoke-speech.ts"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
