@@ -1,11 +1,27 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_MODELS_PATH,
   PROMPT_VERSION,
   SYSTEM_PROMPT,
   VOICE_TOOLS,
+  loadApiKeysConfig,
+  loadModelsFile,
   loadSpikeConfig,
   parseDotEnv,
+  type ModelsFileConfig,
 } from "./config.js";
+
+const NULL_MODELS: ModelsFileConfig = {
+  groqFast: null,
+  groqReliable: null,
+  gemini: null,
+};
+
+const POPULATED_MODELS: ModelsFileConfig = {
+  groqFast: "file-fast-model",
+  groqReliable: "file-reliable-model",
+  gemini: "file-gemini-model",
+};
 
 describe("config", () => {
   it("defines a short plain-text voice system prompt with a version", () => {
@@ -20,20 +36,31 @@ describe("config", () => {
     ]);
   });
 
-  it("requires GROQ_API_KEY and both Groq model env vars without hardcoded defaults", () => {
-    expect(() => loadSpikeConfig({})).toThrow();
-    expect(() =>
-      loadSpikeConfig({
-        GROQ_API_KEY: "gsk_test",
-        GROQ_MODEL_FAST: "fast-model",
-      }),
-    ).toThrow();
+  it("loads valid models.json schema from disk", () => {
+    const models = loadModelsFile(DEFAULT_MODELS_PATH);
+    expect(Object.keys(models).sort()).toEqual(["gemini", "groqFast", "groqReliable"]);
+  });
 
-    const cfg = loadSpikeConfig({
-      GROQ_API_KEY: "gsk_test",
-      GROQ_MODEL_FAST: "model-fast-id",
-      GROQ_MODEL_RELIABLE: "model-reliable-id",
-    });
+  it("requires GROQ_API_KEY and both Groq model IDs when models.json has nulls", () => {
+    expect(() => loadSpikeConfig({}, NULL_MODELS)).toThrow();
+    expect(() =>
+      loadSpikeConfig(
+        {
+          GROQ_API_KEY: "gsk_test",
+          GROQ_MODEL_FAST: "fast-model",
+        },
+        NULL_MODELS,
+      ),
+    ).toThrow(/GROQ_MODEL_RELIABLE/);
+
+    const cfg = loadSpikeConfig(
+      {
+        GROQ_API_KEY: "gsk_test",
+        GROQ_MODEL_FAST: "model-fast-id",
+        GROQ_MODEL_RELIABLE: "model-reliable-id",
+      },
+      NULL_MODELS,
+    );
     expect(cfg).toEqual({
       groqApiKey: "gsk_test",
       groqModelFast: "model-fast-id",
@@ -41,26 +68,76 @@ describe("config", () => {
     });
   });
 
-  it("requires GEMINI_MODEL when GEMINI_API_KEY is present", () => {
+  it("uses models.json values as defaults and lets non-empty env vars override them", () => {
+    const fromFile = loadSpikeConfig(
+      {
+        GROQ_API_KEY: "gsk_test",
+        GEMINI_API_KEY: "AIza_test",
+      },
+      POPULATED_MODELS,
+    );
+    expect(fromFile).toEqual({
+      groqApiKey: "gsk_test",
+      groqModelFast: "file-fast-model",
+      groqModelReliable: "file-reliable-model",
+      geminiApiKey: "AIza_test",
+      geminiModel: "file-gemini-model",
+    });
+
+    const overridden = loadSpikeConfig(
+      {
+        GROQ_API_KEY: "gsk_test",
+        GROQ_MODEL_FAST: "env-fast-model",
+        GROQ_MODEL_RELIABLE: "   ",
+        GEMINI_API_KEY: "AIza_test",
+        GEMINI_MODEL: "env-gemini-model",
+      },
+      POPULATED_MODELS,
+    );
+    expect(overridden.groqModelFast).toBe("env-fast-model");
+    expect(overridden.groqModelReliable).toBe("file-reliable-model");
+    expect(overridden.geminiModel).toBe("env-gemini-model");
+  });
+
+  it("requires GEMINI_MODEL when GEMINI_API_KEY is present and models.json gemini is null", () => {
     expect(() =>
-      loadSpikeConfig({
+      loadSpikeConfig(
+        {
+          GROQ_API_KEY: "gsk_test",
+          GROQ_MODEL_FAST: "model-fast-id",
+          GROQ_MODEL_RELIABLE: "model-reliable-id",
+          GEMINI_API_KEY: "AIza_test",
+        },
+        NULL_MODELS,
+      ),
+    ).toThrow(/GEMINI_MODEL/);
+
+    const cfg = loadSpikeConfig(
+      {
         GROQ_API_KEY: "gsk_test",
         GROQ_MODEL_FAST: "model-fast-id",
         GROQ_MODEL_RELIABLE: "model-reliable-id",
         GEMINI_API_KEY: "AIza_test",
-      }),
-    ).toThrow(/GEMINI_MODEL/);
-
-    const cfg = loadSpikeConfig({
-      GROQ_API_KEY: "gsk_test",
-      GROQ_MODEL_FAST: "model-fast-id",
-      GROQ_MODEL_RELIABLE: "model-reliable-id",
-      GEMINI_API_KEY: "AIza_test",
-      GEMINI_MODEL: "gemini-model-id",
-      GEMINI_REASONING_EFFORT: "minimal",
-    });
+        GEMINI_MODEL: "gemini-model-id",
+        GEMINI_REASONING_EFFORT: "minimal",
+      },
+      NULL_MODELS,
+    );
     expect(cfg.geminiModel).toBe("gemini-model-id");
     expect(cfg.geminiReasoningEffort).toBe("minimal");
+  });
+
+  it("loads API keys without requiring model IDs for --list-models", () => {
+    expect(() => loadApiKeysConfig({})).toThrow(/GROQ_API_KEY/);
+    expect(loadApiKeysConfig({ GROQ_API_KEY: "gsk_test" })).toEqual({
+      groqApiKey: "gsk_test",
+    });
+    expect(
+      loadApiKeysConfig({ GROQ_API_KEY: "gsk_test", GEMINI_API_KEY: "AIza_test" }),
+    ).toEqual({
+      groqApiKey: "gsk_test",
+      geminiApiKey: "AIza_test",
+    });
   });
 
   it("parses .env lines cleanly", () => {

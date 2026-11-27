@@ -1,3 +1,6 @@
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 
 export const PROMPT_VERSION = "voice-v1" as const;
@@ -71,21 +74,59 @@ export const VOICE_TOOLS: readonly OpenAiToolDefinition[] = [
 export const ReasoningEffortSchema = z.enum(["none", "minimal", "low", "medium", "high"]);
 export type ReasoningEffort = z.infer<typeof ReasoningEffortSchema>;
 
-export interface SpikeEnvConfig {
+export const ModelsFileSchema = z.object({
+  groqFast: z.string().trim().min(1).nullable(),
+  groqReliable: z.string().trim().min(1).nullable(),
+  gemini: z.string().trim().min(1).nullable(),
+});
+export type ModelsFileConfig = z.infer<typeof ModelsFileSchema>;
+
+const EMPTY_MODELS: ModelsFileConfig = {
+  groqFast: null,
+  groqReliable: null,
+  gemini: null,
+};
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+export const DEFAULT_MODELS_PATH = path.join(__dirname, "models.json");
+
+export function loadModelsFile(filePath: string = DEFAULT_MODELS_PATH): ModelsFileConfig {
+  if (!existsSync(filePath)) {
+    return EMPTY_MODELS;
+  }
+  const raw = readFileSync(filePath, "utf8");
+  return ModelsFileSchema.parse(JSON.parse(raw) as unknown);
+}
+
+export interface SpikeApiKeysConfig {
   readonly groqApiKey: string;
+  readonly geminiApiKey?: string;
+}
+
+const SpikeApiKeysInputSchema = z.object({
+  GROQ_API_KEY: z.string().trim().min(1, "GROQ_API_KEY is required"),
+  GEMINI_API_KEY: z.string().trim().min(1).optional(),
+});
+
+export interface SpikeEnvConfig extends SpikeApiKeysConfig {
   readonly groqModelFast: string;
   readonly groqModelReliable: string;
   readonly groqFastReasoningEffort?: ReasoningEffort;
   readonly groqReliableReasoningEffort?: ReasoningEffort;
-  readonly geminiApiKey?: string;
   readonly geminiModel?: string;
   readonly geminiReasoningEffort?: ReasoningEffort;
 }
 
 const SpikeEnvInputSchema = z.object({
   GROQ_API_KEY: z.string().trim().min(1, "GROQ_API_KEY is required"),
-  GROQ_MODEL_FAST: z.string().trim().min(1, "GROQ_MODEL_FAST is required"),
-  GROQ_MODEL_RELIABLE: z.string().trim().min(1, "GROQ_MODEL_RELIABLE is required"),
+  GROQ_MODEL_FAST: z
+    .string()
+    .trim()
+    .min(1, "GROQ_MODEL_FAST is required (set env var or models.json groqFast)"),
+  GROQ_MODEL_RELIABLE: z
+    .string()
+    .trim()
+    .min(1, "GROQ_MODEL_RELIABLE is required (set env var or models.json groqReliable)"),
   GROQ_FAST_REASONING_EFFORT: ReasoningEffortSchema.optional(),
   GROQ_RELIABLE_REASONING_EFFORT: ReasoningEffortSchema.optional(),
   GEMINI_API_KEY: z.string().trim().min(1).optional(),
@@ -99,20 +140,34 @@ function emptyToUndefined(value: string | undefined): string | undefined {
   return trimmed.length === 0 ? undefined : trimmed;
 }
 
-export function loadSpikeConfig(env: Record<string, string | undefined>): SpikeEnvConfig {
+export function loadApiKeysConfig(env: Record<string, string | undefined>): SpikeApiKeysConfig {
+  const parsed = SpikeApiKeysInputSchema.parse({
+    GROQ_API_KEY: emptyToUndefined(env.GROQ_API_KEY),
+    GEMINI_API_KEY: emptyToUndefined(env.GEMINI_API_KEY),
+  });
+  return {
+    groqApiKey: parsed.GROQ_API_KEY,
+    ...(parsed.GEMINI_API_KEY !== undefined ? { geminiApiKey: parsed.GEMINI_API_KEY } : {}),
+  };
+}
+
+export function loadSpikeConfig(
+  env: Record<string, string | undefined>,
+  models: ModelsFileConfig = loadModelsFile(),
+): SpikeEnvConfig {
   const parsed = SpikeEnvInputSchema.parse({
     GROQ_API_KEY: emptyToUndefined(env.GROQ_API_KEY),
-    GROQ_MODEL_FAST: emptyToUndefined(env.GROQ_MODEL_FAST),
-    GROQ_MODEL_RELIABLE: emptyToUndefined(env.GROQ_MODEL_RELIABLE),
+    GROQ_MODEL_FAST: emptyToUndefined(env.GROQ_MODEL_FAST) ?? models.groqFast ?? undefined,
+    GROQ_MODEL_RELIABLE: emptyToUndefined(env.GROQ_MODEL_RELIABLE) ?? models.groqReliable ?? undefined,
     GROQ_FAST_REASONING_EFFORT: emptyToUndefined(env.GROQ_FAST_REASONING_EFFORT),
     GROQ_RELIABLE_REASONING_EFFORT: emptyToUndefined(env.GROQ_RELIABLE_REASONING_EFFORT),
     GEMINI_API_KEY: emptyToUndefined(env.GEMINI_API_KEY),
-    GEMINI_MODEL: emptyToUndefined(env.GEMINI_MODEL),
+    GEMINI_MODEL: emptyToUndefined(env.GEMINI_MODEL) ?? models.gemini ?? undefined,
     GEMINI_REASONING_EFFORT: emptyToUndefined(env.GEMINI_REASONING_EFFORT),
   });
 
   if (parsed.GEMINI_API_KEY !== undefined && parsed.GEMINI_MODEL === undefined) {
-    throw new Error("GEMINI_MODEL is required when GEMINI_API_KEY is set");
+    throw new Error("GEMINI_MODEL is required when GEMINI_API_KEY is set (set env var or models.json gemini)");
   }
 
   return {
