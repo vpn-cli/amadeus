@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   estimateFrequencyZeroCrossing,
   findLargestNonDcPeakHannFft,
+  measureHannFftSfdr,
   singleBinDftMagnitude,
 } from "./dft.js";
 import { createResampler, float32ToInt16, int16ToFloat32 } from "./resampler.js";
@@ -73,7 +74,7 @@ describe("streaming resampler", () => {
   );
 
   it.each([48000, 44100])(
-    "keeps 1 kHz (+-0.5 dB) and 3.4 kHz (+-1 dB) passband level and attenuates 10 kHz stopband >= 40 dB in 128-sample blocks (%i Hz -> 16000 Hz)",
+    "keeps 1 kHz (+-0.5 dB) and 3.4 kHz (+-1 dB) passband, attenuates 10 kHz >= 60 dB, and achieves SFDR >= 40 dB in 128-sample blocks (%i Hz -> 16000 Hz)",
     (inputRate) => {
       const amplitude = 0.5;
       const durationSec = 2.2; // >= 2 s; leaves > 32768 samples after 100 ms transient discard
@@ -108,10 +109,19 @@ describe("streaming resampler", () => {
       const stopbandAttenDb =
         20 * Math.log10(peak1k.peakAmplitude / Math.max(peak10k.peakAmplitude, 1e-12));
 
+      const sfdr1k = measureHannFftSfdr(out1k, 16000, 1000, fftSize);
+      const sfdr3k4 = measureHannFftSfdr(out3k4, 16000, 3400, fftSize);
+
+      console.log(
+        `[resampler ${inputRate}->16000] 1kHz gain=${gain1kDb.toFixed(3)} dB | 3.4kHz gain=${gain3k4Db.toFixed(3)} dB | 10kHz rejection=${stopbandAttenDb.toFixed(2)} dB (peak@${peak10k.peakFreqHz.toFixed(1)} Hz) | 1kHz SFDR=${sfdr1k.sfdrDb.toFixed(2)} dB (spur@${sfdr1k.spurFreqHz.toFixed(1)} Hz) | 3.4kHz SFDR=${sfdr3k4.sfdrDb.toFixed(2)} dB (spur@${sfdr3k4.spurFreqHz.toFixed(1)} Hz)`,
+      );
+
       expect(Math.abs(gain1kDb)).toBeLessThanOrEqual(0.5);
       expect(Math.abs(gain3k4Db)).toBeLessThanOrEqual(1.0);
       expect(Math.abs(peak1k.peakFreqHz - 1000)).toBeLessThanOrEqual(2);
-      expect(stopbandAttenDb).toBeGreaterThanOrEqual(40);
+      expect(stopbandAttenDb).toBeGreaterThanOrEqual(60);
+      expect(sfdr1k.sfdrDb).toBeGreaterThanOrEqual(40);
+      expect(sfdr3k4.sfdrDb).toBeGreaterThanOrEqual(40);
     },
   );
 

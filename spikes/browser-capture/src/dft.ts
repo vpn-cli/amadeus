@@ -63,6 +63,16 @@ export interface FftPeakResult {
   peakDb: number;
 }
 
+export interface SfdrResult {
+  fftSize: number;
+  binHz: number;
+  toneFreqHz: number;
+  toneAmplitude: number;
+  spurFreqHz: number;
+  spurAmplitude: number;
+  sfdrDb: number;
+}
+
 /**
  * In-place iterative Cooley-Tukey radix-2 complex FFT (power-of-two length).
  */
@@ -120,15 +130,11 @@ function fftInPlace(re: Float64Array, im: Float64Array): void {
   }
 }
 
-/**
- * Computes a Hann-windowed FFT over `fftSize` samples (largest power of two <= samples.length
- * if omitted) and returns the largest non-DC spectral peak (bins >= 3 to skip DC main-lobe leakage).
- */
-export function findLargestNonDcPeakHannFft(
+function computeHannFftAmplitudes(
   samples: ArrayLike<number>,
   sampleRate: number,
   fftSize?: number,
-): FftPeakResult {
+): { fftSize: number; binHz: number; amplitudes: Float64Array } {
   const n =
     fftSize ??
     (1 << Math.floor(Math.log2(Math.max(8, samples.length))));
@@ -151,24 +157,95 @@ export function findLargestNonDcPeakHannFft(
   fftInPlace(re, im);
 
   const half = n >> 1;
+  const amplitudes = new Float64Array(half + 1);
+  for (let k = 0; k <= half; k++) {
+    const mag = Math.hypot(re[k]!, im[k]!);
+    amplitudes[k] = k === 0 || k === half ? mag / windowSum : (2 * mag) / windowSum;
+  }
+
+  return { fftSize: n, binHz: sampleRate / n, amplitudes };
+}
+
+/**
+ * Computes a Hann-windowed FFT over `fftSize` samples (largest power of two <= samples.length
+ * if omitted) and returns the largest non-DC spectral peak (bins >= 3 to skip DC main-lobe leakage).
+ */
+export function findLargestNonDcPeakHannFft(
+  samples: ArrayLike<number>,
+  sampleRate: number,
+  fftSize?: number,
+): FftPeakResult {
+  const { fftSize: n, binHz, amplitudes } = computeHannFftAmplitudes(
+    samples,
+    sampleRate,
+    fftSize,
+  );
+
   let peakBin = 3;
   let peakAmplitude = -1;
-
-  for (let k = 3; k <= half; k++) {
-    const mag = Math.hypot(re[k]!, im[k]!);
-    const amp = k === half ? mag / windowSum : (2 * mag) / windowSum;
+  for (let k = 3; k < amplitudes.length; k++) {
+    const amp = amplitudes[k]!;
     if (amp > peakAmplitude) {
       peakAmplitude = amp;
       peakBin = k;
     }
   }
 
-  const binHz = sampleRate / n;
   return {
     fftSize: n,
     binHz,
     peakFreqHz: peakBin * binHz,
     peakAmplitude,
     peakDb: 20 * Math.log10(Math.max(peakAmplitude, 1e-12)),
+  };
+}
+
+/**
+ * Measures Spurious-Free Dynamic Range (SFDR) via Hann-windowed FFT by comparing
+ * the fundamental peak near `toneHz` against the largest non-DC spur outside
+ * `+-excludeRadiusHz` (default 10 Hz, skipping Hann main-lobe leakage).
+ */
+export function measureHannFftSfdr(
+  samples: ArrayLike<number>,
+  sampleRate: number,
+  toneHz: number,
+  fftSize?: number,
+  excludeRadiusHz = 10,
+): SfdrResult {
+  const { fftSize: n, binHz, amplitudes } = computeHannFftAmplitudes(
+    samples,
+    sampleRate,
+    fftSize,
+  );
+
+  let toneBin = 3;
+  let toneAmplitude = -1;
+  let spurBin = 3;
+  let spurAmplitude = -1;
+
+  for (let k = 3; k < amplitudes.length; k++) {
+    const freq = k * binHz;
+    const amp = amplitudes[k]!;
+    if (Math.abs(freq - toneHz) <= excludeRadiusHz) {
+      if (amp > toneAmplitude) {
+        toneAmplitude = amp;
+        toneBin = k;
+      }
+    } else if (amp > spurAmplitude) {
+      spurAmplitude = amp;
+      spurBin = k;
+    }
+  }
+
+  const safeTone = Math.max(toneAmplitude, 0);
+  const safeSpur = Math.max(spurAmplitude, 0);
+  return {
+    fftSize: n,
+    binHz,
+    toneFreqHz: toneBin * binHz,
+    toneAmplitude: safeTone,
+    spurFreqHz: spurBin * binHz,
+    spurAmplitude: safeSpur,
+    sfdrDb: 20 * Math.log10(safeTone / Math.max(safeSpur, 1e-12)),
   };
 }
