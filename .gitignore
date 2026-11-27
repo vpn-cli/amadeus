@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build & cache outputs
+dist/
+build/
+.vite/
+coverage/
+.turbo/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+
+# Spike generated audio / downloaded models
+spikes/**/out/
+spikes/**/*.wav
+spikes/**/*.onnx
+
+# OS / Editor
+.DS_Store
+Thumbs.db
