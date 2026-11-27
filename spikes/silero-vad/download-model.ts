@@ -15,7 +15,15 @@ export function sha256Hex(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-export async function ensureModel(modelPath = DEFAULT_MODEL_PATH): Promise<string> {
+export interface EnsureModelOptions {
+  log?: (message: string) => void;
+}
+
+export async function ensureModel(
+  modelPath = DEFAULT_MODEL_PATH,
+  options: EnsureModelOptions = {},
+): Promise<string> {
+  const log = options.log ?? console.log;
   try {
     const info = await stat(modelPath);
     if (info.size > 0) {
@@ -33,7 +41,7 @@ export async function ensureModel(modelPath = DEFAULT_MODEL_PATH): Promise<strin
   }
 
   await mkdir(dirname(modelPath), { recursive: true });
-  console.log(`Downloading Silero VAD ${SILERO_MODEL_TAG} ONNX model from ${MODEL_URL}...`);
+  log(`Downloading Silero VAD ${SILERO_MODEL_TAG} ONNX model from ${MODEL_URL}...`);
   const res = await fetch(MODEL_URL);
   if (!res.ok) {
     throw new Error(`Failed to download model: ${res.status} ${res.statusText}`);
@@ -47,7 +55,7 @@ export async function ensureModel(modelPath = DEFAULT_MODEL_PATH): Promise<strin
   }
 
   await writeFile(modelPath, bytes);
-  console.log(`Saved ${bytes.byteLength} bytes to ${modelPath} (sha256: ${actualHash})`);
+  log(`Saved ${bytes.byteLength} bytes to ${modelPath} (sha256: ${actualHash})`);
   return modelPath;
 }
 

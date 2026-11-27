@@ -1,4 +1,5 @@
 import { basename, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   DEFAULT_MODEL_PATH,
   SILERO_MODEL_SHA256,
@@ -15,24 +16,41 @@ import {
   runVadOnSamples,
   summarizeVadRun,
 } from "./eval.js";
+import {
+  SileroParamsJsonSchema,
+  SileroRunJsonSchema,
+  SileroSegmentJsonSchema,
+  type SileroRunJson,
+} from "./json-schema.js";
 import { DEFAULT_SEGMENTER_CONFIG } from "./segmenter.js";
 import { SileroVad } from "./silero.js";
 import { readPcm16Wav } from "./wav.js";
+
+export {
+  SileroParamsJsonSchema,
+  SileroRunJsonSchema,
+  SileroSegmentJsonSchema,
+  type SileroRunJson,
+};
 
 interface CliOptions {
   wavPath: string;
   labelsPath: string | null;
   autoDetectLabels: boolean;
+  json: boolean;
 }
 
 function parseArgs(argv: readonly string[]): CliOptions {
   let wavArg: string | null = null;
   let labelsArg: string | null = null;
   let autoDetectLabels = true;
+  let json = false;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === "--no-labels") {
+    if (arg === "--json") {
+      json = true;
+    } else if (arg === "--no-labels") {
       autoDetectLabels = false;
     } else if (arg === "--labels") {
       const next = argv[++i];
@@ -58,7 +76,7 @@ function parseArgs(argv: readonly string[]): CliOptions {
     : resolve(import.meta.dirname, "out", "sample-16k.wav");
 
   const labelsPath = labelsArg ? resolve(process.cwd(), labelsArg) : null;
-  return { wavPath, labelsPath, autoDetectLabels };
+  return { wavPath, labelsPath, autoDetectLabels, json };
 }
 
 function renderBar(prob: number, width = 24): string {
@@ -74,45 +92,75 @@ async function main(): Promise<void> {
       : options.labelsPath !== null
         ? options.labelsPath
         : undefined;
-  const { labelsPath, labels } = await loadSidecarLabels(options.wavPath, explicitLabels);
 
-  const modelPath = await ensureModel(DEFAULT_MODEL_PATH);
+  const diag = options.json ? console.error : console.log;
+  const modelPath = await ensureModel(DEFAULT_MODEL_PATH, { log: diag });
   const vad = await SileroVad.create(modelPath);
   const wav = await readPcm16Wav(options.wavPath);
 
   try {
-    console.log(`Loaded WAV: ${options.wavPath}`);
-    console.log(`Duration: ${wav.durationMs.toFixed(0)} ms (${wav.float32.length} samples)`);
-    console.log(`Model: Silero VAD ${SILERO_MODEL_TAG} (sha256: ${SILERO_MODEL_SHA256})`);
-    console.log(
-      `Model inputs: [${vad.inputNames.join(", ")}] -> outputs: [${vad.outputNames.join(", ")}]`,
-    );
-    if (labelsPath !== null && labels !== null) {
-      console.log(`Labels: ${labelsPath} (${labels.length} labels)`);
+    const { labelsPath, labels } = options.json
+      ? { labelsPath: null, labels: null }
+      : await loadSidecarLabels(options.wavPath, explicitLabels);
+
+    if (!options.json) {
+      console.log(`Loaded WAV: ${options.wavPath}`);
+      console.log(`Duration: ${wav.durationMs.toFixed(0)} ms (${wav.float32.length} samples)`);
+      console.log(`Model: Silero VAD ${SILERO_MODEL_TAG} (sha256: ${SILERO_MODEL_SHA256})`);
+      console.log(
+        `Model inputs: [${vad.inputNames.join(", ")}] -> outputs: [${vad.outputNames.join(", ")}]`,
+      );
+      if (labelsPath !== null && labels !== null) {
+        console.log(`Labels: ${labelsPath} (${labels.length} labels)`);
+      }
+      console.log("");
     }
-    console.log("");
 
     const { segments, inferenceTimesMs } = await runVadOnSamples(vad, wav.float32, {
-      onWindow: ({ windowIdx, currentMs, prob, state, stepEvents }) => {
-        if (
-          windowIdx % 4 === 0 ||
-          prob >= DEFAULT_SEGMENTER_CONFIG.onsetThreshold ||
-          stepEvents.length > 0
-        ) {
-          const tag = state.toUpperCase().padEnd(8);
-          const eventNote =
-            stepEvents.length > 0
-              ? ` | ${stepEvents.map((e) => `${e.type}(${e.reason})`).join(", ")}`
-              : "";
-          console.log(
-            `${(currentMs / 1000).toFixed(2).padStart(6)}s | ${prob.toFixed(3)} | ${renderBar(prob)} | ${tag}${eventNote}`,
-          );
-        }
-      },
+      onWindow: options.json
+        ? undefined
+        : ({ windowIdx, currentMs, prob, state, stepEvents }) => {
+            if (
+              windowIdx % 4 === 0 ||
+              prob >= DEFAULT_SEGMENTER_CONFIG.onsetThreshold ||
+              stepEvents.length > 0
+            ) {
+              const tag = state.toUpperCase().padEnd(8);
+              const eventNote =
+                stepEvents.length > 0
+                  ? ` | ${stepEvents.map((e) => `${e.type}(${e.reason})`).join(", ")}`
+                  : "";
+              console.log(
+                `${(currentMs / 1000).toFixed(2).padStart(6)}s | ${prob.toFixed(3)} | ${renderBar(prob)} | ${tag}${eventNote}`,
+              );
+            }
+          },
     });
+
+    if (options.json) {
+      const payload: SileroRunJson = SileroRunJsonSchema.parse({
+        modelSha256: SILERO_MODEL_SHA256,
+        params: {
+          windowSamples: DEFAULT_SEGMENTER_CONFIG.windowSamples,
+          onsetThreshold: DEFAULT_SEGMENTER_CONFIG.onsetThreshold,
+          offsetThreshold: DEFAULT_SEGMENTER_CONFIG.offsetThreshold,
+          minSpeechMs: DEFAULT_SEGMENTER_CONFIG.minSpeechMs,
+          endSilenceMs: DEFAULT_SEGMENTER_CONFIG.endSilenceMs,
+          pendingGapMs: DEFAULT_SEGMENTER_CONFIG.pendingGapMs,
+          maxSpeechMs: DEFAULT_SEGMENTER_CONFIG.maxSpeechMs,
+        },
+        sampleRate: wav.sampleRate,
+        durationMs: wav.durationMs,
+        segments,
+      });
+      process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+      return;
+    }
 
     const comparison = evaluateSegments(segments, labels);
     const summary = summarizeVadRun(basename(options.wavPath), segments, comparison);
+    const sorted = [...inferenceTimesMs].sort((a, b) => a - b);
+    const avg = sorted.reduce((acc, v) => acc + v, 0) / Math.max(1, sorted.length);
 
     console.log("\n--- Detected Speech Segments ---");
     for (const line of renderPerSegmentErrorTable(segments, comparison)) {
@@ -131,9 +179,6 @@ async function main(): Promise<void> {
       }
     }
 
-    const sorted = [...inferenceTimesMs].sort((a, b) => a - b);
-    const avg = sorted.reduce((acc, v) => acc + v, 0) / Math.max(1, sorted.length);
-
     console.log("\n--- Silero ONNX Inference Latency (per 32ms window) ---");
     console.log(
       `Windows: ${sorted.length} | avg=${avg.toFixed(3)} ms | p50=${percentile(sorted, 50).toFixed(3)} ms | p95=${percentile(sorted, 95).toFixed(3)} ms | max=${(sorted[sorted.length - 1] ?? 0).toFixed(3)} ms`,
@@ -143,7 +188,13 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+const isMainModule =
+  typeof process.argv[1] === "string" &&
+  import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+
+if (isMainModule) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
