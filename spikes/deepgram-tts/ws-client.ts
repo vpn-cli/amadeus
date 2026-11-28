@@ -262,6 +262,7 @@ export class DeepgramTtsWsSession {
   readonly flushLimiter = new FlushRateLimiter();
 
   private readonly ws: WebSocket;
+  private readonly agent: http.Agent | https.Agent;
   private metadata: DeepgramTtsMetadataMessage | null = null;
   private readonly sessionNotices: ClassifiedServerNotice[] = [];
   private closed = false;
@@ -278,12 +279,14 @@ export class DeepgramTtsWsSession {
   private constructor(
     url: string,
     ws: WebSocket,
+    agent: http.Agent | https.Agent,
     connectTimings: WsConnectionTimings,
     openedAtMs: number,
   ) {
     this.url = url;
     this.host = new URL(url).hostname;
     this.ws = ws;
+    this.agent = agent;
     this.connectTimings = connectTimings;
     this.openedAtMs = openedAtMs;
 
@@ -313,6 +316,7 @@ export class DeepgramTtsWsSession {
       this.closed = true;
       this.closeCode = Number.isFinite(code) ? code : null;
       this.closeReason = reasonBuf.toString("utf8");
+      this.agent.destroy();
       this.activeCloseHandler?.(code, this.closeReason);
       this.closeResolve({
         metadata: this.metadata,
@@ -406,7 +410,7 @@ export class DeepgramTtsWsSession {
           statusCode: statusCode ?? 101,
           headers: upgradeHeaders,
         };
-        resolve(new DeepgramTtsWsSession(url, ws, timings, tOpenDone));
+        resolve(new DeepgramTtsWsSession(url, ws, timed.agent, timings, tOpenDone));
       });
 
       ws.once("error", (err: NodeJS.ErrnoException) => {
@@ -875,11 +879,14 @@ export class DeepgramTtsWsSession {
         settled = true;
         clearTimeout(timer);
         this.ws.off("pong", onPong);
+        this.ws.off("close", onClose);
         resolve({ ok, rttMs });
       };
       const onPong = () => finish(true, performance.now() - tStart);
+      const onClose = () => finish(false, null);
       const timer = setTimeout(() => finish(false, null), timeoutMs);
       this.ws.once("pong", onPong);
+      this.ws.once("close", onClose);
       this.ws.ping();
     });
   }
@@ -949,8 +956,15 @@ export class DeepgramTtsWsSession {
 
   /**
    * Holds socket idle without sending text and waits up to maxWaitMs for server close.
+   * Optionally sends WebSocket protocol ping frames (not KeepAlive JSON) every pingIntervalMs.
    */
-  async waitForIdleClose(maxWaitMs = 70_000): Promise<{
+  async waitForIdleClose(
+    maxWaitMs = 70_000,
+    options: {
+      readonly pingIntervalMs?: number;
+      readonly onPing?: (rttMs: number | null, elapsedMs: number) => void;
+    } = {},
+  ): Promise<{
     readonly closedByServer: boolean;
     readonly idleElapsedMs: number;
     readonly closeCode: number | null;
@@ -969,31 +983,57 @@ export class DeepgramTtsWsSession {
     const tStart = performance.now();
     const noticesStartIdx = this.sessionNotices.length;
 
-    const summary = await Promise.race([
-      this.closePromise,
-      new Promise<null>((resolve) => setTimeout(() => resolve(null), maxWaitMs)),
-    ]);
+    let maxTimer: NodeJS.Timeout | undefined;
+    let pingTimer: NodeJS.Timeout | undefined;
+    let pingInFlight = false;
 
-    if (summary === null) {
-      return {
-        closedByServer: false,
-        idleElapsedMs: performance.now() - tStart,
-        closeCode: null,
-        closeReason: null,
-        notices: this.sessionNotices.slice(noticesStartIdx),
-      };
+    if (options.pingIntervalMs !== undefined && options.pingIntervalMs > 0) {
+      pingTimer = setInterval(() => {
+        if (this.closed || this.ws.readyState !== WebSocket.OPEN || pingInFlight) return;
+        pingInFlight = true;
+        void this.probePing(4000).then((res) => {
+          pingInFlight = false;
+          options.onPing?.(res.ok ? res.rttMs : null, performance.now() - tStart);
+        });
+      }, options.pingIntervalMs);
     }
 
-    return {
-      closedByServer: true,
-      idleElapsedMs: performance.now() - tStart,
-      closeCode: summary.closeCode,
-      closeReason: summary.closeReason,
-      notices: this.sessionNotices.slice(noticesStartIdx),
-    };
+    try {
+      const summary = await Promise.race([
+        this.closePromise,
+        new Promise<null>((resolve) => {
+          maxTimer = setTimeout(() => resolve(null), maxWaitMs);
+        }),
+      ]);
+
+      if (summary === null) {
+        return {
+          closedByServer: false,
+          idleElapsedMs: performance.now() - tStart,
+          closeCode: null,
+          closeReason: null,
+          notices: this.sessionNotices.slice(noticesStartIdx),
+        };
+      }
+
+      return {
+        closedByServer: true,
+        idleElapsedMs: performance.now() - tStart,
+        closeCode: summary.closeCode,
+        closeReason: summary.closeReason,
+        notices: this.sessionNotices.slice(noticesStartIdx),
+      };
+    } finally {
+      if (maxTimer !== undefined) clearTimeout(maxTimer);
+      if (pingTimer !== undefined) clearInterval(pingTimer);
+    }
   }
 
   async closeGracefully(timeoutMs = 2500): Promise<DeepgramTtsCloseSummary> {
+    if (this.closed) {
+      this.agent.destroy();
+      return await this.closePromise;
+    }
     if (this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(serializeClientCommand({ type: "Close" }));
     }
@@ -1006,6 +1046,7 @@ export class DeepgramTtsWsSession {
             if (!this.closed) {
               this.ws.terminate();
             }
+            this.agent.destroy();
             resolve({
               metadata: this.metadata,
               closeCode: this.closeCode,
@@ -1018,6 +1059,7 @@ export class DeepgramTtsWsSession {
       ]);
     } finally {
       if (timer !== undefined) clearTimeout(timer);
+      this.agent.destroy();
     }
   }
 }

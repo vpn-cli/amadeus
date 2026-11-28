@@ -20,8 +20,10 @@ Copy `.env.example` to `.env` at the repo root and set `DEEPGRAM_API_KEY`:
 ```powershell
 pnpm --dir spikes/deepgram-tts install
 pnpm --dir spikes/deepgram-tts typecheck
-pnpm --dir spikes/deepgram-tts exec vitest run --reporter=verbose   # 25 unit tests across 6 files (zero API keys)
+pnpm --dir spikes/deepgram-tts exec vitest run --reporter=verbose   # 26 unit tests across 6 files (zero API keys)
 pnpm --dir spikes/deepgram-tts live                                  # N=10 interleaved WS & REST -> out/results.json + out/*.wav
+pnpm --dir spikes/deepgram-tts live -- --smoke                       # N=1 India-only smoke run (~850 chars) -> out/smoke-results.json
+pnpm --dir spikes/deepgram-tts live -- --idle-probe                  # 0 chars: 5-min idle hold on api.in.deepgram.com (WS ping / 20 s)
 ```
 
 ## Live Benchmark Results (2026-11-28, Node `v24.15.0`, India, `aura-2-thalia-en`)
@@ -66,8 +68,10 @@ pnpm --dir spikes/deepgram-tts live                                  # N=10 inte
 
 | Host | Fresh Open (`n=20`) Total med / p90 | DNS / TCP / TLS / Upgrade med | Warm New Sockets (`n=20`) | WS `ping` RTT (`n=1`) | `{"type":"KeepAlive"}` (`n=1`) | Pure Idle Hold (`n=1`) |
 | --- | --- | --- | --- | --- | --- | --- |
-| `api.in.deepgram.com` | **`184.5 / 295.2 ms`** | `1.5` / `50.5` / `52.8` / `75.8 ms` | `0/20` | `49.3 ms` | **Closed `1008 DATA-0000`** | **`>= 75.0 s` (still open)** |
+| `api.in.deepgram.com` | **`184.5 / 295.2 ms`** | `1.5` / `50.5` / `52.8` / `75.8 ms` | `0/20` | `49.3 ms` | **Closed `1008 DATA-0000`** | **`>= 75.0 s` (still open)** (`300.00 s` w/ 20 s WS ping) |
 | `api.deepgram.com` | `840.1 / 1607.1 ms` | `46.6` / `260.5` / `264.4` / `279.3 ms` | `0/20` | `283.1 ms` | **Closed `1008 DATA-0000`** | **`>= 75.0 s` (still open)** |
+
+> **5-minute idle lifetime probe (`--idle-probe`, `api.in.deepgram.com` only, `0` chars):** Opened one `/v1/speak` socket (`187.7 ms`, HTTP `101`), sent no `Speak`/`Flush`/`KeepAlive` (only WS protocol `ping` every `20 s`, 14 pongs at `50.2–51.0 ms` RTT), and the server kept the socket open for the full **`300.00 s`** cap (`notices=0`).
 
 ### 2e. REST `POST /v1/speak` Comparison (`undici` warm `Agent`, `N = 10` per cell)
 
@@ -87,14 +91,26 @@ pnpm --dir spikes/deepgram-tts live                                  # N=10 inte
 
 ## Phase 1 design constraints
 
-1. **`Flush` rate limit (`20 Flushes / 60 s`) — documented behavior & scope:**
-   - **Docs facts (`tts-ws-flush.md`, `streaming-text-to-speech.md`, `api-rate-limits.md`):** Deepgram caps `Flush` at **20 Flushes every 60 seconds** and documents it under the `/v1/speak` WebSocket stream limits alongside the `60-minute` WebSocket lifetime and `2,400 chars/min` WebSocket throughput limit (`1008 DATA-0001`), whereas project-wide limits in `api-rate-limits.md` are **concurrency** caps (`45` concurrent Aura-2 WS streams on Pay-as-You-Go, `15` REST). (The docs do not print the literal phrase "per WebSocket connection" vs "per API key", though it appears under WebSocket session limits.)
-   - **Exceeding behavior:** Non-fatal server **`Warning`** JSON message (`{ type: "Warning", code, description }`) stating that additional `Flush` messages cannot be processed until the 60-second window passes; no `Error` event or WebSocket close code is documented for `Flush` throttling (unlike `1003`/`1008`/`1009`/`1011`), though docs warn that very frequent flushes degrade audio output quality.
-   - **Related WS limits:** `2,000` chars max per `Speak` message (`413`), `2,400 chars/min` WebSocket character throughput (`1008 DATA-0001`), `60-minute` connection lifetime, and **`1008 DATA-0000`** immediate close if an unrecognized JSON type such as `{"type":"KeepAlive"}` is sent (verified on both hosts).
+1. **`Flush` rate limit (`20 Flushes / 60 s`) — exact doc text, scope & exceeded behavior:**
+   - **Exact doc text:**
+     - [`tts-ws-flush`](https://developers.deepgram.com/docs/tts-ws-flush) (`## Limits`):
+       > "The maximum number of times you can send the `Flush` message is 20 times every 60 seconds. After that, you'll receive a warning message stating that we cannot process any more flush messages until the 60-second time window has passed."
+       (And under `Warning`: `"Very frequent flushes can affect audio output quality."`)
+     - [`streaming-text-to-speech`](https://developers.deepgram.com/docs/streaming-text-to-speech) (`## Limits` → `### Flush message limits`):
+       > "The maximum number of times you can send the [Flush message](/docs/tts-ws-flush) is 20 times every 60 seconds. After that, you'll receive a warning message stating that we cannot process any more flush messages until the 60-second time window has passed."
+   - **Scope (per connection vs per key/project):** **not documented.** Neither `tts-ws-flush` nor `streaming-text-to-speech` nor [`api-rate-limits`](https://developers.deepgram.com/reference/api-rate-limits) states whether `20 Flushes / 60 s` is scoped per WebSocket connection or per API key/project (`api-rate-limits` documents concurrency limits per project — `45` concurrent Aura-2 WS streams on Pay-as-You-Go, `15` REST — and `streaming-text-to-speech` lists `Flush` alongside the `60-minute` WebSocket timeout and `2,400 chars/min` WebSocket throughput limit).
+   - **Server behavior when exceeded:** sends a `Warning` message stating it cannot process any more flush messages until the 60-second time window has passed. An `Error` message or WebSocket close code for `Flush` throttling is **not documented** (`1008 DATA-0001` in `tts-troubleshooting-websocket-net-and-data-errors` is for character throughput).
 
-2. **Concrete recommendation for sentence-level streaming (supported by measured data):**
+2. **Never send `{"type":"KeepAlive"}` on a TTS socket:**
+   - `/v1/speak` rejects `{"type":"KeepAlive"}` and immediately closes the WebSocket with **`1008 DATA-0000`** (verified on both `api.in.deepgram.com` and `api.deepgram.com`). Keep the pre-warmed socket alive between turns with **WebSocket protocol `ping` frames** every ~20 s if needed — verified `300.00 s` idle survival (`0` notices) on `api.in.deepgram.com`.
+
+3. **Mid-utterance audio-stall timeout (`tts_stall`):**
+   - A mid-utterance audio-stall timeout is required: in the benchmark, the default host (`api.deepgram.com`) stalled **`13–23 s`** mid-stream in `2a`/`2b` and timed out once at **`30 s`**.
+   - **Phase 1 behavior on stall:** abort the stalled synthesis leg, play the pre-rendered fallback audio clip, and log a **`tts_stall`** error (do not leave the turn hanging in `SPEAKING`).
+
+4. **Concrete recommendation for sentence-level streaming (supported by measured data):**
    - **Use one pre-warmed `wss://api.in.deepgram.com/v1/speak` WebSocket per call (`START_CALL`), and Flush ONLY the first sentence immediately + one final Flush at end-of-turn (batch/stream intermediate sentences with `Speak` without extra `Flush`es)** — do **not** open one socket per turn.
    - **Why the data supports this over one-socket-per-turn:**
      - Opening a fresh socket per turn adds **`184.5 ms` med / `295.2 ms` p90** on `api.in.deepgram.com` (`840.1 / 1607.1 ms` on `api.deepgram.com`), erasing WS's `~70–94 ms` latency lead over REST and eating `~185 ms` of our `<= 1,500 ms` turn budget.
-     - Reusing one pre-warmed socket per call delivers **`107.0 ms` med (`111.1 ms` p90)** `tts_first_audio`, `0/20` reconnects, `>= 75 s` idle survival without keep-alive JSON frames (use WS protocol `ping` if needed, never `{"type":"KeepAlive"}`), and **`100%` (`10/10`) survival after `Clear`** (`42.5 ms` `Clear -> Cleared`, `101.3 ms` next-turn audio).
+     - Reusing one pre-warmed socket per call delivers **`107.0 ms` med (`111.1 ms` p90)** `tts_first_audio`, `0/20` reconnects, **`>= 300 s`** idle survival on `api.in.deepgram.com` with 20 s WS `ping` (never `{"type":"KeepAlive"}`), and **`100%` (`10/10`) survival after `Clear`** (`42.5 ms` `Clear -> Cleared`, `101.3 ms` next-turn audio).
      - Flushing **only sentence 1 immediately** (for minimal `tts_first_audio`) and **once at LLM stream end** uses **1–2 Flushes per turn** (`10–20` turns/min on one socket), staying safely below `20 Flushes / 60 s` while keeping `J = 60–100 ms` client jitter buffering at `0/60` underruns.

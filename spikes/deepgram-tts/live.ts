@@ -43,6 +43,12 @@ const TIME_TEXT = "It's 3:45 PM right now.";
 
 const DEFAULT_N = 10;
 const IDLE_WAIT_MAX_MS = 75_000;
+const IDLE_PROBE_5MIN_MS = 300_000;
+const IDLE_PROBE_PING_INTERVAL_MS = 20_000;
+
+function hasCliFlag(argv: readonly string[], flag: string): boolean {
+  return argv.includes(flag);
+}
 
 function loadEnvFromRoot(): void {
   const candidates = [path.join(REPO_ROOT, ".env"), path.join(__dirname, ".env")];
@@ -185,9 +191,10 @@ function printStatsLine(label: string, s: DistributionStats): void {
 async function probeHosts(
   apiKey: string,
   model: string,
+  hosts: readonly DeepgramTtsHostSpec[] = DEEPGRAM_TTS_HOSTS,
 ): Promise<HostCapability[]> {
   const results: HostCapability[] = [];
-  for (const spec of DEEPGRAM_TTS_HOSTS) {
+  for (const spec of hosts) {
     const wsUrl = buildDeepgramSpeakWsUrl(spec.host, { model });
     let wsSupported = false;
     let wsProbeError: string | null = null;
@@ -256,25 +263,81 @@ async function probeHosts(
   return results;
 }
 
+async function runIdleLifetimeProbe(apiKey: string, model: string, maxWaitMs: number): Promise<void> {
+  const hostSpec = DEEPGRAM_TTS_HOSTS.find((h) => h.id === "in");
+  if (!hostSpec) {
+    throw new Error("India host spec (id='in') not found");
+  }
+  const wsUrl = buildDeepgramSpeakWsUrl(hostSpec.host, { model });
+  console.log("=== Deepgram Aura-2 TTS — Idle Lifetime Probe (0 chars) ===");
+  console.log(
+    `Host: ${hostSpec.host} | Model: ${model} | MaxWait: ${(maxWaitMs / 1000).toFixed(0)} s | WS ping every ${(IDLE_PROBE_PING_INTERVAL_MS / 1000).toFixed(0)} s (no KeepAlive, no Speak)`,
+  );
+
+  const sess = await DeepgramTtsWsSession.connect(wsUrl, apiKey);
+  try {
+    console.log(
+      `  Connected in ${sess.connectTimings.totalOpenMs.toFixed(1)} ms (HTTP ${sess.connectTimings.statusCode})`,
+    );
+    const res = await sess.waitForIdleClose(maxWaitMs, {
+      pingIntervalMs: IDLE_PROBE_PING_INTERVAL_MS,
+      onPing: (rttMs, elapsedMs) => {
+        console.log(
+          `  [${(elapsedMs / 1000).toFixed(1)}s] WS ping -> ${rttMs !== null ? `pong ${rttMs.toFixed(1)} ms` : "no pong"}`,
+        );
+      },
+    });
+    if (res.closedByServer) {
+      console.log(
+        `RESULT: Server closed idle /speak socket at ${(res.idleElapsedMs / 1000).toFixed(2)} s | closeCode=${res.closeCode ?? "none"} | closeReason="${res.closeReason ?? ""}" | notices=${res.notices.length}`,
+      );
+    } else {
+      console.log(
+        `RESULT: Socket stayed OPEN for full ${(res.idleElapsedMs / 1000).toFixed(2)} s (${(maxWaitMs / 1000).toFixed(0)} s cap) | notices=${res.notices.length}`,
+      );
+    }
+    for (const n of res.notices) {
+      console.log(`  Notice: ${n.kind.toUpperCase()} [${n.code}] ${n.description}`);
+    }
+  } finally {
+    await sess.closeGracefully();
+  }
+  console.log(`Active resources after idle probe: ${JSON.stringify(process.getActiveResourcesInfo())}`);
+}
+
 async function main(): Promise<void> {
   loadEnvFromRoot();
   const cfg = loadTtsSpikeConfig(process.env);
-  const N = parseCliIntFlag(process.argv.slice(2), "--n", DEFAULT_N);
+  const argv = process.argv.slice(2);
+  const isIdleProbe = hasCliFlag(argv, "--idle-probe");
+  const isSmoke = hasCliFlag(argv, "--smoke");
 
-  const hostsCount = DEEPGRAM_TTS_HOSTS.length;
+  if (isIdleProbe) {
+    const maxWaitMs = parseCliIntFlag(argv, "--idle-ms", IDLE_PROBE_5MIN_MS);
+    await runIdleLifetimeProbe(cfg.deepgramApiKey, cfg.ttsModel, maxWaitMs);
+    return;
+  }
+
+  const N = parseCliIntFlag(argv, "--n", isSmoke ? 1 : DEFAULT_N);
+  const idleWaitMs = parseCliIntFlag(argv, "--idle-ms", isSmoke ? 2000 : IDLE_WAIT_MAX_MS);
+  const targetHosts = isSmoke
+    ? DEEPGRAM_TTS_HOSTS.filter((h) => h.id === "in")
+    : DEEPGRAM_TTS_HOSTS;
+
+  const hostsCount = targetHosts.length;
   const probeChars = hostsCount * 6; // "Hi." (3) WS + "Hi." (3) REST per host
   const chars2a = hostsCount * 2 * (SHORT_TEXT.length + LONG_TEXT.length) * N;
   const chars2b = hostsCount * 2 * (STREAM_S1.length + STREAM_S2.length) * N;
   const chars2c = hostsCount * (LONG_TEXT.length + SHORT_TEXT.length) * N;
   const chars2eWarmup = hostsCount * SHORT_TEXT.length;
   const chars2e = hostsCount * (SHORT_TEXT.length + LONG_TEXT.length) * N;
-  const charsManual = hostsCount * TIME_TEXT.length;
+  const charsManual = isSmoke ? 0 : hostsCount * TIME_TEXT.length;
   const plannedChars =
     probeChars + chars2a + chars2b + chars2c + chars2eWarmup + chars2e + charsManual;
 
   const budget = evaluateTtsCharBudget(plannedChars, cfg.maxChars);
-  console.log("=== Deepgram Aura-2 TTS Spike — Character & Cost Budget ===");
-  console.log(`Model: ${cfg.ttsModel} | Hosts: ${DEEPGRAM_TTS_HOSTS.map((h) => h.host).join(", ")} | N=${N}`);
+  console.log(`=== Deepgram Aura-2 TTS Spike${isSmoke ? " (SMOKE)" : ""} — Character & Cost Budget ===`);
+  console.log(`Model: ${cfg.ttsModel} | Hosts: ${targetHosts.map((h) => h.host).join(", ")} | N=${N}`);
   console.log(
     `Planned chars breakdown: probe=${probeChars}, 2a=${chars2a}, 2b=${chars2b}, 2c=${chars2c}, 2e_warmup=${chars2eWarmup}, 2e=${chars2e}, manual_wav=${charsManual}`,
   );
@@ -283,13 +346,14 @@ async function main(): Promise<void> {
   );
   if (!budget.ok) {
     console.error(`ABORT: ${budget.reason}`);
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
 
   mkdirSync(OUT_DIR, { recursive: true });
 
   console.log("\n=== Host Capability Probe (WS + REST /v1/speak) ===");
-  const capabilities = await probeHosts(cfg.deepgramApiKey, cfg.ttsModel);
+  const capabilities = await probeHosts(cfg.deepgramApiKey, cfg.ttsModel, targetHosts);
   for (const cap of capabilities) {
     console.log(
       `  ${cap.spec.host} (${cap.spec.regionLabel}): WS=${cap.wsSupported ? "OK" : `UNSUPPORTED (${cap.wsProbeError})`} | REST=${cap.restSupported ? "OK" : `UNSUPPORTED (${cap.restProbeError})`}`,
@@ -313,303 +377,342 @@ async function main(): Promise<void> {
   // 2a: tts_first_audio (warm & fresh × serving hosts × short & long, interleaved)
   console.log("\n=== 2a. tts_first_audio (WS Warm vs Fresh × Short vs Long, interleaved) ===");
   const warm2aSockets = new Map<string, DeepgramTtsWsSession>();
-  for (const h of wsHosts) {
-    warm2aSockets.set(
-      h.id,
-      await DeepgramTtsWsSession.connect(
-        buildDeepgramSpeakWsUrl(h.host, { model: cfg.ttsModel }),
-        cfg.deepgramApiKey,
-      ),
-    );
-  }
-
   const records2a: Turn2aRecord[] = [];
   const savedWavs: Array<{ readonly file: string; readonly host: string; readonly text: string; readonly durationMs: number }> = [];
   const savedShortWsHosts = new Set<string>();
   const savedLongWsHosts = new Set<string>();
 
-  for (let i = 0; i < N; i += 1) {
-    const lengthOrder: readonly ("short" | "long")[] = i % 2 === 0 ? ["short", "long"] : ["long", "short"];
-    const slots: Array<{ readonly host: DeepgramTtsHostSpec; readonly mode: "warm" | "fresh" }> = [];
-    for (const h of wsHosts) slots.push({ host: h, mode: "warm" });
-    for (const h of wsHosts) slots.push({ host: h, mode: "fresh" });
-
-    for (const slot of slots) {
-      for (const lengthKind of lengthOrder) {
-        const text = lengthKind === "short" ? SHORT_TEXT : LONG_TEXT;
-        let session: DeepgramTtsWsSession;
-        let openTimings: WsConnectionTimings | null = null;
-        if (slot.mode === "warm") {
-          let existing = warm2aSockets.get(slot.host.id);
-          if (!existing || !existing.isOpen) {
-            existing = await DeepgramTtsWsSession.connect(
-              buildDeepgramSpeakWsUrl(slot.host.host, { model: cfg.ttsModel }),
-              cfg.deepgramApiKey,
-            );
-            warm2aSockets.set(slot.host.id, existing);
-            openTimings = existing.connectTimings;
-          } else {
-            openTimings = { ...existing.connectTimings, newSocket: false };
-          }
-          session = existing;
-        } else {
-          session = await DeepgramTtsWsSession.connect(
-            buildDeepgramSpeakWsUrl(slot.host.host, { model: cfg.ttsModel }),
-            cfg.deepgramApiKey,
-          );
-          openTimings = session.connectTimings;
-        }
-
-        const result = await session.synthesizeTurn({ text });
-        for (const notice of result.notices) {
-          allNotices.push({ phase: "2a", host: slot.host.host, notice });
-        }
-        if (slot.mode === "warm" && (result.timedOut || !session.isOpen)) {
-          await session.closeGracefully();
-          warm2aSockets.delete(slot.host.id);
-        }
-        const formatCheck = checkRawPcm24kFormat(result.pcmBytes, text);
-        records2a.push({
-          iteration: i + 1,
-          hostId: slot.host.id,
-          socketMode: slot.mode,
-          lengthKind,
-          openTimings,
-          result,
-          formatCheck,
-        });
-
-        if (lengthKind === "short" && !savedShortWsHosts.has(slot.host.id) && result.pcmBytes.byteLength > 0) {
-          savedShortWsHosts.add(slot.host.id);
-          const wavPath = path.join(OUT_DIR, `order-1042-${slot.host.id}-ws.wav`);
-          await writePcm16Wav(wavPath, result.pcmBytes);
-          savedWavs.push({
-            file: path.relative(REPO_ROOT, wavPath).replace(/\\/g, "/"),
-            host: slot.host.host,
-            text,
-            durationMs: formatCheck.durationMs,
-          });
-        }
-        if (lengthKind === "long" && !savedLongWsHosts.has(slot.host.id) && result.pcmBytes.byteLength > 0) {
-          savedLongWsHosts.add(slot.host.id);
-          const wavPath = path.join(OUT_DIR, `long-20w-${slot.host.id}-ws.wav`);
-          await writePcm16Wav(wavPath, result.pcmBytes);
-          savedWavs.push({
-            file: path.relative(REPO_ROOT, wavPath).replace(/\\/g, "/"),
-            host: slot.host.host,
-            text,
-            durationMs: formatCheck.durationMs,
-          });
-        }
-
-        if (slot.mode === "fresh") {
-          await session.closeGracefully();
-        }
-      }
-    }
-    console.log(`  2a iteration ${i + 1}/${N} done`);
-  }
-
-  for (const sess of warm2aSockets.values()) {
-    await sess.closeGracefully();
-  }
-
-  // 2b: Sentence streaming (50 ms vs 300 ms gaps, interleaved across hosts & gaps)
-  console.log("\n=== 2b. Sentence Streaming Timeline (gap 50 ms vs 300 ms, interleaved) ===");
-  const warm2bSockets = new Map<string, DeepgramTtsWsSession>();
-  for (const h of wsHosts) {
-    for (const gapMs of [50, 300] as const) {
-      warm2bSockets.set(
-        `${h.id}:${gapMs}`,
+  try {
+    for (const h of wsHosts) {
+      warm2aSockets.set(
+        h.id,
         await DeepgramTtsWsSession.connect(
           buildDeepgramSpeakWsUrl(h.host, { model: cfg.ttsModel }),
           cfg.deepgramApiKey,
         ),
       );
     }
+
+    for (let i = 0; i < N; i += 1) {
+      const lengthOrder: readonly ("short" | "long")[] = i % 2 === 0 ? ["short", "long"] : ["long", "short"];
+      const slots: Array<{ readonly host: DeepgramTtsHostSpec; readonly mode: "warm" | "fresh" }> = [];
+      for (const h of wsHosts) slots.push({ host: h, mode: "warm" });
+      for (const h of wsHosts) slots.push({ host: h, mode: "fresh" });
+
+      for (const slot of slots) {
+        for (const lengthKind of lengthOrder) {
+          const text = lengthKind === "short" ? SHORT_TEXT : LONG_TEXT;
+          let session: DeepgramTtsWsSession;
+          let openTimings: WsConnectionTimings | null = null;
+          if (slot.mode === "warm") {
+            let existing = warm2aSockets.get(slot.host.id);
+            if (!existing || !existing.isOpen) {
+              if (existing) {
+                await existing.closeGracefully();
+                warm2aSockets.delete(slot.host.id);
+              }
+              existing = await DeepgramTtsWsSession.connect(
+                buildDeepgramSpeakWsUrl(slot.host.host, { model: cfg.ttsModel }),
+                cfg.deepgramApiKey,
+              );
+              warm2aSockets.set(slot.host.id, existing);
+              openTimings = existing.connectTimings;
+            } else {
+              openTimings = { ...existing.connectTimings, newSocket: false };
+            }
+            session = existing;
+          } else {
+            session = await DeepgramTtsWsSession.connect(
+              buildDeepgramSpeakWsUrl(slot.host.host, { model: cfg.ttsModel }),
+              cfg.deepgramApiKey,
+            );
+            openTimings = session.connectTimings;
+          }
+
+          try {
+            const result = await session.synthesizeTurn({ text });
+            for (const notice of result.notices) {
+              allNotices.push({ phase: "2a", host: slot.host.host, notice });
+            }
+            if (slot.mode === "warm" && (result.timedOut || !session.isOpen)) {
+              await session.closeGracefully();
+              warm2aSockets.delete(slot.host.id);
+            }
+            const formatCheck = checkRawPcm24kFormat(result.pcmBytes, text);
+            records2a.push({
+              iteration: i + 1,
+              hostId: slot.host.id,
+              socketMode: slot.mode,
+              lengthKind,
+              openTimings,
+              result,
+              formatCheck,
+            });
+
+            if (!isSmoke && lengthKind === "short" && !savedShortWsHosts.has(slot.host.id) && result.pcmBytes.byteLength > 0) {
+              savedShortWsHosts.add(slot.host.id);
+              const wavPath = path.join(OUT_DIR, `order-1042-${slot.host.id}-ws.wav`);
+              await writePcm16Wav(wavPath, result.pcmBytes);
+              savedWavs.push({
+                file: path.relative(REPO_ROOT, wavPath).replace(/\\/g, "/"),
+                host: slot.host.host,
+                text,
+                durationMs: formatCheck.durationMs,
+              });
+            }
+            if (!isSmoke && lengthKind === "long" && !savedLongWsHosts.has(slot.host.id) && result.pcmBytes.byteLength > 0) {
+              savedLongWsHosts.add(slot.host.id);
+              const wavPath = path.join(OUT_DIR, `long-20w-${slot.host.id}-ws.wav`);
+              await writePcm16Wav(wavPath, result.pcmBytes);
+              savedWavs.push({
+                file: path.relative(REPO_ROOT, wavPath).replace(/\\/g, "/"),
+                host: slot.host.host,
+                text,
+                durationMs: formatCheck.durationMs,
+              });
+            }
+          } finally {
+            if (slot.mode === "fresh") {
+              await session.closeGracefully();
+            }
+          }
+        }
+      }
+      console.log(`  2a iteration ${i + 1}/${N} done`);
+    }
+  } finally {
+    for (const sess of warm2aSockets.values()) {
+      await sess.closeGracefully();
+    }
+    warm2aSockets.clear();
   }
 
+  // 2b: Sentence streaming (50 ms vs 300 ms gaps, interleaved across hosts & gaps)
+  console.log("\n=== 2b. Sentence Streaming Timeline (gap 50 ms vs 300 ms, interleaved) ===");
+  const warm2bSockets = new Map<string, DeepgramTtsWsSession>();
   const records2b: Stream2bRecord[] = [];
-  for (let i = 0; i < N; i += 1) {
-    const gaps: readonly (50 | 300)[] = i % 2 === 0 ? [50, 300] : [300, 50];
-    for (const gapMs of gaps) {
-      for (const h of wsHosts) {
-        const key = `${h.id}:${gapMs}`;
-        let sess = warm2bSockets.get(key);
-        if (!sess || !sess.isOpen) {
-          sess = await DeepgramTtsWsSession.connect(
+  try {
+    for (const h of wsHosts) {
+      for (const gapMs of [50, 300] as const) {
+        warm2bSockets.set(
+          `${h.id}:${gapMs}`,
+          await DeepgramTtsWsSession.connect(
             buildDeepgramSpeakWsUrl(h.host, { model: cfg.ttsModel }),
             cfg.deepgramApiKey,
-          );
-          warm2bSockets.set(key, sess);
-        }
-        const result = await sess.streamTwoSentences({
-          sentence1: STREAM_S1,
-          sentence2: STREAM_S2,
-          gapMs,
-        });
-        for (const notice of result.notices) {
-          allNotices.push({ phase: "2b", host: h.host, notice });
-        }
-        const formatCheck = checkRawPcm24kFormat(result.pcmBytes, `${STREAM_S1} ${STREAM_S2}`);
-        records2b.push({
-          iteration: i + 1,
-          hostId: h.id,
-          gapMs,
-          result,
-          formatCheck,
-        });
+          ),
+        );
       }
     }
-    console.log(`  2b iteration ${i + 1}/${N} done`);
-  }
 
-  for (const sess of warm2bSockets.values()) {
-    await sess.closeGracefully();
+    for (let i = 0; i < N; i += 1) {
+      const gaps: readonly (50 | 300)[] = i % 2 === 0 ? [50, 300] : [300, 50];
+      for (const gapMs of gaps) {
+        for (const h of wsHosts) {
+          const key = `${h.id}:${gapMs}`;
+          let sess = warm2bSockets.get(key);
+          if (!sess || !sess.isOpen) {
+            if (sess) {
+              await sess.closeGracefully();
+              warm2bSockets.delete(key);
+            }
+            sess = await DeepgramTtsWsSession.connect(
+              buildDeepgramSpeakWsUrl(h.host, { model: cfg.ttsModel }),
+              cfg.deepgramApiKey,
+            );
+            warm2bSockets.set(key, sess);
+          }
+          const result = await sess.streamTwoSentences({
+            sentence1: STREAM_S1,
+            sentence2: STREAM_S2,
+            gapMs,
+          });
+          for (const notice of result.notices) {
+            allNotices.push({ phase: "2b", host: h.host, notice });
+          }
+          if (result.timedOut || !sess.isOpen) {
+            await sess.closeGracefully();
+            warm2bSockets.delete(key);
+          }
+          const formatCheck = checkRawPcm24kFormat(result.pcmBytes, `${STREAM_S1} ${STREAM_S2}`);
+          records2b.push({
+            iteration: i + 1,
+            hostId: h.id,
+            gapMs,
+            result,
+            formatCheck,
+          });
+        }
+      }
+      console.log(`  2b iteration ${i + 1}/${N} done`);
+    }
+  } finally {
+    for (const sess of warm2bSockets.values()) {
+      await sess.closeGracefully();
+    }
+    warm2bSockets.clear();
   }
 
   // 2c: Barge-in Clear + immediate next turn on same socket
   console.log("\n=== 2c. Barge-in Clear + Same-Socket Survival (interleaved) ===");
   const warm2cSockets = new Map<string, DeepgramTtsWsSession>();
-  for (const h of wsHosts) {
-    warm2cSockets.set(
-      h.id,
-      await DeepgramTtsWsSession.connect(
-        buildDeepgramSpeakWsUrl(h.host, { model: cfg.ttsModel }),
-        cfg.deepgramApiKey,
-      ),
-    );
-  }
-
   const records2c: Clear2cRecord[] = [];
-  for (let i = 0; i < N; i += 1) {
+  try {
     for (const h of wsHosts) {
-      let sess = warm2cSockets.get(h.id);
-      if (!sess || !sess.isOpen) {
-        sess = await DeepgramTtsWsSession.connect(
+      warm2cSockets.set(
+        h.id,
+        await DeepgramTtsWsSession.connect(
           buildDeepgramSpeakWsUrl(h.host, { model: cfg.ttsModel }),
           cfg.deepgramApiKey,
-        );
-        warm2cSockets.set(h.id, sess);
-      }
-      const result = await sess.runBargeInClear({
-        sentence1: LONG_TEXT,
-        nextSentence: SHORT_TEXT,
-        clearAfterFirstAudioMs: 40,
-        postClearDrainMs: 150,
-      });
-      for (const notice of result.notices) {
-        allNotices.push({ phase: "2c", host: h.host, notice });
-      }
-      records2c.push({
-        iteration: i + 1,
-        hostId: h.id,
-        result,
-      });
+        ),
+      );
     }
-    console.log(`  2c iteration ${i + 1}/${N} done`);
-  }
 
-  for (const sess of warm2cSockets.values()) {
-    await sess.closeGracefully();
+    for (let i = 0; i < N; i += 1) {
+      for (const h of wsHosts) {
+        let sess = warm2cSockets.get(h.id);
+        if (!sess || !sess.isOpen) {
+          if (sess) {
+            await sess.closeGracefully();
+            warm2cSockets.delete(h.id);
+          }
+          sess = await DeepgramTtsWsSession.connect(
+            buildDeepgramSpeakWsUrl(h.host, { model: cfg.ttsModel }),
+            cfg.deepgramApiKey,
+          );
+          warm2cSockets.set(h.id, sess);
+        }
+        const result = await sess.runBargeInClear({
+          sentence1: LONG_TEXT,
+          nextSentence: SHORT_TEXT,
+          clearAfterFirstAudioMs: 40,
+          postClearDrainMs: 150,
+        });
+        for (const notice of result.notices) {
+          allNotices.push({ phase: "2c", host: h.host, notice });
+        }
+        if (!result.socketSurvived || !sess.isOpen) {
+          await sess.closeGracefully();
+          warm2cSockets.delete(h.id);
+        }
+        records2c.push({
+          iteration: i + 1,
+          hostId: h.id,
+          result,
+        });
+      }
+      console.log(`  2c iteration ${i + 1}/${N} done`);
+    }
+  } finally {
+    for (const sess of warm2cSockets.values()) {
+      await sess.closeGracefully();
+    }
+    warm2cSockets.clear();
   }
 
   // 2e: REST comparison (warm undici Agent per serving host)
   console.log("\n=== 2e. REST POST /v1/speak Comparison (warm undici Agent, interleaved) ===");
   const restAgents = new Map<string, ReturnType<typeof createWarmRestAgent>>();
-  for (const h of restHosts) {
-    const warm = createWarmRestAgent();
-    restAgents.set(h.id, warm);
-    // Single warm-up request (included in budget) so all N*2 benchmark requests reuse socket
-    await synthesizeRest({
-      url: buildDeepgramSpeakRestUrl(h.host, { model: cfg.ttsModel }),
-      apiKey: cfg.deepgramApiKey,
-      text: SHORT_TEXT,
-      dispatcher: warm.agent,
-      consumeNewSocketFlag: warm.consumeNewSocketFlag,
-    });
-  }
-
   const records2e: Rest2eRecord[] = [];
   const savedRestHosts = new Set<string>();
-  for (let i = 0; i < N; i += 1) {
-    const lengthOrder: readonly ("short" | "long")[] = i % 2 === 0 ? ["short", "long"] : ["long", "short"];
+  try {
     for (const h of restHosts) {
-      const warm = restAgents.get(h.id)!;
-      const url = buildDeepgramSpeakRestUrl(h.host, { model: cfg.ttsModel });
-      for (const lengthKind of lengthOrder) {
-        const text = lengthKind === "short" ? SHORT_TEXT : LONG_TEXT;
-        const res = await synthesizeRest({
-          url,
-          apiKey: cfg.deepgramApiKey,
-          text,
-          dispatcher: warm.agent,
-          consumeNewSocketFlag: warm.consumeNewSocketFlag,
-        });
-        const formatCheck = checkRawPcm24kFormat(res.pcmBytes, text);
-        records2e.push({
-          iteration: i + 1,
-          hostId: h.id,
-          lengthKind,
-          newSocket: res.newSocket,
-          statusCode: res.statusCode,
-          ok: res.ok,
-          headersMs: res.headersMs,
-          ttfbMs: res.ttfbMs,
-          totalMs: res.totalMs,
-          firstChunkMs: res.timelineJ0.firstChunkMs,
-          streamRtf: res.timelineJ0.streamRtf,
-          underrunsJ0: res.timelineJ0.underrunCount,
-          starvedMsJ0: res.timelineJ0.totalStarvedMs,
-          underrunsJ100: res.timelineJ100.underrunCount,
-          starvedMsJ100: res.timelineJ100.totalStarvedMs,
-          headers: res.headers,
-          formatCheck,
-          errorMessage: res.errorMessage,
-        });
+      const warm = createWarmRestAgent();
+      restAgents.set(h.id, warm);
+      // Single warm-up request (included in budget) so all N*2 benchmark requests reuse socket
+      await synthesizeRest({
+        url: buildDeepgramSpeakRestUrl(h.host, { model: cfg.ttsModel }),
+        apiKey: cfg.deepgramApiKey,
+        text: SHORT_TEXT,
+        dispatcher: warm.agent,
+        consumeNewSocketFlag: warm.consumeNewSocketFlag,
+      });
+    }
 
-        if (lengthKind === "short" && !savedRestHosts.has(h.id) && res.pcmBytes.byteLength > 0) {
-          savedRestHosts.add(h.id);
-          const wavPath = path.join(OUT_DIR, `order-1042-${h.id}-rest.wav`);
-          await writePcm16Wav(wavPath, res.pcmBytes);
-          savedWavs.push({
-            file: path.relative(REPO_ROOT, wavPath).replace(/\\/g, "/"),
-            host: h.host,
+    for (let i = 0; i < N; i += 1) {
+      const lengthOrder: readonly ("short" | "long")[] = i % 2 === 0 ? ["short", "long"] : ["long", "short"];
+      for (const h of restHosts) {
+        const warm = restAgents.get(h.id)!;
+        const url = buildDeepgramSpeakRestUrl(h.host, { model: cfg.ttsModel });
+        for (const lengthKind of lengthOrder) {
+          const text = lengthKind === "short" ? SHORT_TEXT : LONG_TEXT;
+          const res = await synthesizeRest({
+            url,
+            apiKey: cfg.deepgramApiKey,
             text,
-            durationMs: formatCheck.durationMs,
+            dispatcher: warm.agent,
+            consumeNewSocketFlag: warm.consumeNewSocketFlag,
           });
+          const formatCheck = checkRawPcm24kFormat(res.pcmBytes, text);
+          records2e.push({
+            iteration: i + 1,
+            hostId: h.id,
+            lengthKind,
+            newSocket: res.newSocket,
+            statusCode: res.statusCode,
+            ok: res.ok,
+            headersMs: res.headersMs,
+            ttfbMs: res.ttfbMs,
+            totalMs: res.totalMs,
+            firstChunkMs: res.timelineJ0.firstChunkMs,
+            streamRtf: res.timelineJ0.streamRtf,
+            underrunsJ0: res.timelineJ0.underrunCount,
+            starvedMsJ0: res.timelineJ0.totalStarvedMs,
+            underrunsJ100: res.timelineJ100.underrunCount,
+            starvedMsJ100: res.timelineJ100.totalStarvedMs,
+            headers: res.headers,
+            formatCheck,
+            errorMessage: res.errorMessage,
+          });
+
+          if (!isSmoke && lengthKind === "short" && !savedRestHosts.has(h.id) && res.pcmBytes.byteLength > 0) {
+            savedRestHosts.add(h.id);
+            const wavPath = path.join(OUT_DIR, `order-1042-${h.id}-rest.wav`);
+            await writePcm16Wav(wavPath, res.pcmBytes);
+            savedWavs.push({
+              file: path.relative(REPO_ROOT, wavPath).replace(/\\/g, "/"),
+              host: h.host,
+              text,
+              durationMs: formatCheck.durationMs,
+            });
+          }
         }
       }
+      console.log(`  2e iteration ${i + 1}/${N} done`);
     }
-    console.log(`  2e iteration ${i + 1}/${N} done`);
-  }
-
-  for (const warm of restAgents.values()) {
-    await warm.close();
+  } finally {
+    for (const warm of restAgents.values()) {
+      await warm.close();
+    }
+    restAgents.clear();
   }
 
   // Manual listening time WAV
-  for (const h of wsHosts) {
-    const sess = await DeepgramTtsWsSession.connect(
-      buildDeepgramSpeakWsUrl(h.host, { model: cfg.ttsModel }),
-      cfg.deepgramApiKey,
-    );
-    const turn = await sess.synthesizeTurn({ text: TIME_TEXT });
-    for (const notice of turn.notices) {
-      allNotices.push({ phase: "manual_wav", host: h.host, notice });
+  if (!isSmoke) {
+    for (const h of wsHosts) {
+      const sess = await DeepgramTtsWsSession.connect(
+        buildDeepgramSpeakWsUrl(h.host, { model: cfg.ttsModel }),
+        cfg.deepgramApiKey,
+      );
+      try {
+        const turn = await sess.synthesizeTurn({ text: TIME_TEXT });
+        for (const notice of turn.notices) {
+          allNotices.push({ phase: "manual_wav", host: h.host, notice });
+        }
+        const fmt = checkRawPcm24kFormat(turn.pcmBytes, TIME_TEXT);
+        if (turn.pcmBytes.byteLength > 0) {
+          const wavPath = path.join(OUT_DIR, `time-345pm-${h.id}-ws.wav`);
+          await writePcm16Wav(wavPath, turn.pcmBytes);
+          savedWavs.push({
+            file: path.relative(REPO_ROOT, wavPath).replace(/\\/g, "/"),
+            host: h.host,
+            text: TIME_TEXT,
+            durationMs: fmt.durationMs,
+          });
+        }
+      } finally {
+        await sess.closeGracefully();
+      }
     }
-    const fmt = checkRawPcm24kFormat(turn.pcmBytes, TIME_TEXT);
-    if (turn.pcmBytes.byteLength > 0) {
-      const wavPath = path.join(OUT_DIR, `time-345pm-${h.id}-ws.wav`);
-      await writePcm16Wav(wavPath, turn.pcmBytes);
-      savedWavs.push({
-        file: path.relative(REPO_ROOT, wavPath).replace(/\\/g, "/"),
-        host: h.host,
-        text: TIME_TEXT,
-        durationMs: fmt.durationMs,
-      });
-    }
-    await sess.closeGracefully();
   }
 
   // 2d: Idle timeout & KeepAlive behavior per serving host
@@ -620,22 +723,27 @@ async function main(): Promise<void> {
 
     // Probe 1: WS ping/pong + {"type":"KeepAlive"}
     const sess1 = await DeepgramTtsWsSession.connect(wsUrl, cfg.deepgramApiKey);
-    const ping = await sess1.probePing(4000);
-    const keepAliveReaction = await sess1.probeJsonControl({ type: "KeepAlive" }, 4000);
-    for (const notice of keepAliveReaction.notices) {
-      allNotices.push({ phase: "2d_keepalive", host: h.host, notice });
-    }
-    if (sess1.isOpen) {
+    let ping: { readonly ok: boolean; readonly rttMs: number | null };
+    let keepAliveReaction: IdleProbeRecord["keepAliveReaction"];
+    try {
+      ping = await sess1.probePing(4000);
+      keepAliveReaction = await sess1.probeJsonControl({ type: "KeepAlive" }, 4000);
+      for (const notice of keepAliveReaction.notices) {
+        allNotices.push({ phase: "2d_keepalive", host: h.host, notice });
+      }
+    } finally {
       await sess1.closeGracefully();
     }
 
-    // Probe 2: Pure idle hold (no Speak, no KeepAlive) up to 75 s
+    // Probe 2: Pure idle hold (no Speak, no KeepAlive)
     const sess2 = await DeepgramTtsWsSession.connect(wsUrl, cfg.deepgramApiKey);
-    const pureIdleHold = await sess2.waitForIdleClose(IDLE_WAIT_MAX_MS);
-    for (const notice of pureIdleHold.notices) {
-      allNotices.push({ phase: "2d_idle", host: h.host, notice });
-    }
-    if (sess2.isOpen) {
+    let pureIdleHold: IdleProbeRecord["pureIdleHold"];
+    try {
+      pureIdleHold = await sess2.waitForIdleClose(idleWaitMs);
+      for (const notice of pureIdleHold.notices) {
+        allNotices.push({ phase: "2d_idle", host: h.host, notice });
+      }
+    } finally {
       await sess2.closeGracefully();
     }
 
@@ -653,7 +761,7 @@ async function main(): Promise<void> {
 
   // Print full human-readable summary tables
   console.log("\n=== SUMMARY: 2a tts_first_audio (WS /v1/speak) ===");
-  for (const h of DEEPGRAM_TTS_HOSTS) {
+  for (const h of targetHosts) {
     const cap = capabilities.find((c) => c.spec.id === h.id)!;
     if (!cap.wsSupported) {
       console.log(`  ${h.host}: UNSUPPORTED (${cap.wsProbeError})`);
@@ -803,12 +911,14 @@ async function main(): Promise<void> {
     savedWavs,
     allNotices,
   };
-  writeFileSync(RESULTS_PATH, JSON.stringify(serializable, null, 2), "utf8");
-  console.log(`\nSaved ${path.relative(REPO_ROOT, RESULTS_PATH).replace(/\\/g, "/")}`);
+  const outPath = isSmoke ? path.join(OUT_DIR, "smoke-results.json") : RESULTS_PATH;
+  writeFileSync(outPath, JSON.stringify(serializable, null, 2), "utf8");
+  console.log(`\nSaved ${path.relative(REPO_ROOT, outPath).replace(/\\/g, "/")}`);
+  console.log(`Active resources at completion: ${JSON.stringify(process.getActiveResourcesInfo())}`);
   void printStatsLine;
 }
 
 main().catch((err) => {
   console.error(err instanceof Error ? err.message : String(err));
-  process.exit(1);
+  process.exitCode = 1;
 });

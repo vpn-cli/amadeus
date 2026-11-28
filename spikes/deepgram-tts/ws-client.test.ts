@@ -206,4 +206,37 @@ describe("ws-client", () => {
       },
     );
   });
+
+  it("supports waitForIdleClose with periodic WS pings and clears timers on early server close", async () => {
+    let pingCount = 0;
+    await withMockWsServer(
+      (ws) => {
+        ws.on("ping", () => {
+          pingCount += 1;
+        });
+        setTimeout(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.close(1000, "Idle test done");
+          }
+        }, 70);
+      },
+      async (port) => {
+        const session = await DeepgramTtsWsSession.connect(
+          `ws://127.0.0.1:${port}/v1/speak`,
+          "test_key",
+        );
+        const pings: Array<number | null> = [];
+        const res = await session.waitForIdleClose(10_000, {
+          pingIntervalMs: 25,
+          onPing: (rttMs) => pings.push(rttMs),
+        });
+        expect(res.closedByServer).toBe(true);
+        expect(res.closeCode).toBe(1000);
+        expect(res.closeReason).toBe("Idle test done");
+        expect(res.idleElapsedMs).toBeLessThan(1000);
+        expect(pingCount).toBeGreaterThanOrEqual(1);
+        await session.closeGracefully();
+      },
+    );
+  });
 });
