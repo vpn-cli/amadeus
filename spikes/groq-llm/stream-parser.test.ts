@@ -4,6 +4,7 @@ import {
   detectClaimedCheckWithoutToolCall,
   isDailyRateLimitBody,
   validateCurrentTimeToolCalls,
+  validateCurrentTimeV3ToolCalls,
   validateOrderStatusToolCalls,
 } from "./stream-parser.js";
 
@@ -367,6 +368,43 @@ describe("GroqStreamAccumulator", () => {
     expect(validation.reason).toContain("tool_use_failed");
     expect(validation.reason).toContain("expected string, but got null");
     expect(validation.reason).not.toBe("no_tool_call");
+  });
+
+  it("validates parameterless tools-v3 get_current_time calls strictly", () => {
+    expect(
+      validateCurrentTimeV3ToolCalls([
+        {
+          index: 0,
+          id: "v3_1",
+          type: "function",
+          name: "get_current_time",
+          rawArguments: "{}",
+          parsedArguments: {},
+          validJson: true,
+        },
+      ]),
+    ).toMatchObject({
+      calledAnyTool: true,
+      calledExpectedTool: true,
+      validJsonArgs: true,
+      validArgsSchema: true,
+      passed: true,
+      reason: null,
+    });
+
+    expect(
+      validateCurrentTimeV3ToolCalls([
+        {
+          index: 0,
+          id: "v3_2",
+          type: "function",
+          name: "get_current_time",
+          rawArguments: '{"timezone":"Asia/Kolkata"}',
+          parsedArguments: { timezone: "Asia/Kolkata" },
+          validJson: true,
+        },
+      ]).reason,
+    ).toBe("schema_mismatch");
   });
 
   it("distinguishes daily TPD/RPD 429 errors from short TPM/RPM bursts", () => {

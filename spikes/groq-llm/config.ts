@@ -9,10 +9,16 @@ export const PROMPT_VERSION = PROMPT_VERSION_V1;
 
 export const TOOL_SCHEMA_VERSION_V1 = "tools-v1" as const;
 export const TOOL_SCHEMA_VERSION_V2 = "tools-v2" as const;
+export const TOOL_SCHEMA_VERSION_V3 = "tools-v3" as const;
 export const TOOL_SCHEMA_VERSION = TOOL_SCHEMA_VERSION_V1;
 
+export const DEFAULT_SESSION_TIMEZONE = "Asia/Kolkata" as const;
+
 export type PromptVersion = typeof PROMPT_VERSION_V1 | typeof PROMPT_VERSION_V2;
-export type ToolSchemaVersion = typeof TOOL_SCHEMA_VERSION_V1 | typeof TOOL_SCHEMA_VERSION_V2;
+export type ToolSchemaVersion =
+  | typeof TOOL_SCHEMA_VERSION_V1
+  | typeof TOOL_SCHEMA_VERSION_V2
+  | typeof TOOL_SCHEMA_VERSION_V3;
 
 export const SYSTEM_PROMPT_V1 =
   "You are a concise voice support assistant. Reply in one or two short natural spoken sentences using plain text only, with no markdown, symbols, or lists.";
@@ -49,6 +55,8 @@ export const OrderStatusArgsSchema = z.object({
 export const CurrentTimeArgsSchema = z.object({
   timezone: z.string().trim().min(1).nullish(),
 });
+
+export const CurrentTimeV3ArgsSchema = z.object({}).strict();
 
 export interface OpenAiToolDefinition {
   readonly type: "function";
@@ -119,6 +127,22 @@ export const VOICE_TOOLS_V2: readonly OpenAiToolDefinition[] = [
   },
 ];
 
+export const VOICE_TOOLS_V3: readonly OpenAiToolDefinition[] = [
+  VOICE_TOOLS_V1[0]!,
+  {
+    type: "function",
+    function: {
+      name: "get_current_time",
+      description: "Call whenever the user asks for the current time or date.",
+      parameters: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
+    },
+  },
+];
+
 export const VOICE_TOOLS = VOICE_TOOLS_V1;
 
 export interface PromptProfile {
@@ -137,9 +161,9 @@ export const PROMPT_PROFILES: Readonly<Record<PromptVersion, PromptProfile>> = {
   },
   "voice-v2": {
     promptVersion: PROMPT_VERSION_V2,
-    toolSchemaVersion: TOOL_SCHEMA_VERSION_V2,
+    toolSchemaVersion: TOOL_SCHEMA_VERSION_V3,
     systemPrompt: SYSTEM_PROMPT_V2,
-    tools: VOICE_TOOLS_V2,
+    tools: VOICE_TOOLS_V3,
   },
 };
 
@@ -256,6 +280,7 @@ export interface SpikeEnvConfig extends SpikeApiKeysConfig {
   readonly groqNoReasonReasoningEffort?: ReasoningEffort;
   readonly geminiModel?: string;
   readonly geminiReasoningEffort?: ReasoningEffort;
+  readonly sessionTimezone: string;
 }
 
 const SpikeEnvInputSchema = z.object({
@@ -275,6 +300,7 @@ const SpikeEnvInputSchema = z.object({
   GEMINI_API_KEY: z.string().trim().min(1).optional(),
   GEMINI_MODEL: z.string().trim().min(1).optional(),
   GEMINI_REASONING_EFFORT: ReasoningEffortSchema.optional(),
+  SESSION_TIMEZONE: z.string().trim().min(1).optional(),
 });
 
 function emptyToUndefined(value: string | undefined): string | undefined {
@@ -310,6 +336,7 @@ export function loadSpikeConfig(
     GEMINI_API_KEY: emptyToUndefined(env.GEMINI_API_KEY),
     GEMINI_MODEL: emptyToUndefined(env.GEMINI_MODEL) ?? models.gemini ?? undefined,
     GEMINI_REASONING_EFFORT: emptyToUndefined(env.GEMINI_REASONING_EFFORT),
+    SESSION_TIMEZONE: emptyToUndefined(env.SESSION_TIMEZONE),
   });
 
   if (parsed.GEMINI_API_KEY !== undefined && parsed.GEMINI_MODEL === undefined) {
@@ -337,6 +364,7 @@ export function loadSpikeConfig(
     ...(parsed.GEMINI_REASONING_EFFORT !== undefined
       ? { geminiReasoningEffort: parsed.GEMINI_REASONING_EFFORT }
       : {}),
+    sessionTimezone: parsed.SESSION_TIMEZONE ?? DEFAULT_SESSION_TIMEZONE,
   };
 }
 

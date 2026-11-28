@@ -1,5 +1,6 @@
 import {
   CurrentTimeArgsSchema,
+  CurrentTimeV3ArgsSchema,
   EXPECTED_ORDER_ID,
   OrderStatusArgsSchema,
 } from "./config.js";
@@ -502,6 +503,19 @@ export function validateCurrentTimeToolCalls(
     toolCalls,
     "get_current_time",
     CurrentTimeArgsSchema,
+    undefined,
+    streamError,
+  );
+}
+
+export function validateCurrentTimeV3ToolCalls(
+  toolCalls: readonly AssembledToolCall[],
+  streamError?: StreamErrorInfo | null,
+): ToolValidationResult {
+  return validateToolCallWithSchema(
+    toolCalls,
+    "get_current_time",
+    CurrentTimeV3ArgsSchema,
     undefined,
     streamError,
   );

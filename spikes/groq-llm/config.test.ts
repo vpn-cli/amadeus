@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_MODELS_PATH,
+  DEFAULT_SESSION_TIMEZONE,
   NEAR_MISS_SHIPPING_PROMPT,
   NEAR_MISS_TIME_PROMPT,
   PROMPT_PROFILES,
@@ -13,9 +14,11 @@ import {
   TIME_TOOL_PROMPT_V2,
   TOOL_SCHEMA_VERSION_V1,
   TOOL_SCHEMA_VERSION_V2,
+  TOOL_SCHEMA_VERSION_V3,
   VOICE_TOOLS,
   VOICE_TOOLS_V1,
   VOICE_TOOLS_V2,
+  VOICE_TOOLS_V3,
   loadApiKeysConfig,
   loadModelsFile,
   loadSpikeConfig,
@@ -60,16 +63,27 @@ describe("config", () => {
     });
     expect(PROMPT_PROFILES["voice-v2"]).toEqual({
       promptVersion: PROMPT_VERSION_V2,
-      toolSchemaVersion: TOOL_SCHEMA_VERSION_V2,
+      toolSchemaVersion: TOOL_SCHEMA_VERSION_V3,
       systemPrompt: SYSTEM_PROMPT_V2,
-      tools: VOICE_TOOLS_V2,
+      tools: VOICE_TOOLS_V3,
     });
     expect(SYSTEM_PROMPT_V2.startsWith(SYSTEM_PROMPT_V1)).toBe(true);
     expect(SYSTEM_PROMPT_V2).toContain("Never ask for a timezone");
     expect(SYSTEM_PROMPT_V2).toContain(
       "Never say you are checking something unless you call the tool in the same reply.",
     );
+    expect(TOOL_SCHEMA_VERSION_V2).toBe("tools-v2");
     expect(VOICE_TOOLS_V2[1]?.function.description).toContain("Asia/Kolkata");
+    expect(VOICE_TOOLS_V3[1]?.function).toEqual({
+      name: "get_current_time",
+      description: "Call whenever the user asks for the current time or date.",
+      parameters: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
+    });
+    expect(DEFAULT_SESSION_TIMEZONE).toBe("Asia/Kolkata");
     expect(VOICE_TOOLS_V1[1]?.function.description).toBe(
       "Get the current time, optionally for a given IANA timezone.",
     );
@@ -112,6 +126,7 @@ describe("config", () => {
       groqApiKey: "gsk_test",
       groqModelFast: "model-fast-id",
       groqModelReliable: "model-reliable-id",
+      sessionTimezone: "Asia/Kolkata",
     });
   });
 
@@ -130,6 +145,7 @@ describe("config", () => {
       groqModelNoReason: "file-noreason-model",
       geminiApiKey: "AIza_test",
       geminiModel: "file-gemini-model",
+      sessionTimezone: "Asia/Kolkata",
     });
 
     const overridden = loadSpikeConfig(
@@ -141,6 +157,7 @@ describe("config", () => {
         GROQ_NOREASON_REASONING_EFFORT: "none",
         GEMINI_API_KEY: "AIza_test",
         GEMINI_MODEL: "env-gemini-model",
+        SESSION_TIMEZONE: "America/New_York",
       },
       POPULATED_MODELS,
     );
@@ -149,6 +166,7 @@ describe("config", () => {
     expect(overridden.groqModelNoReason).toBe("env-noreason-model");
     expect(overridden.groqNoReasonReasoningEffort).toBe("none");
     expect(overridden.geminiModel).toBe("env-gemini-model");
+    expect(overridden.sessionTimezone).toBe("America/New_York");
   });
 
   it("requires GEMINI_MODEL when GEMINI_API_KEY is present and models.json gemini is null", () => {

@@ -8,6 +8,7 @@ import { Agent, buildConnector, fetch, type Dispatcher, type Response } from "un
 import { ZodError } from "zod";
 import {
   CurrentTimeArgsSchema,
+  DEFAULT_SESSION_TIMEZONE,
   GROQ_SERVICE_TIERS,
   NEAR_MISS_SHIPPING_PROMPT,
   NEAR_MISS_TIME_PROMPT,
@@ -25,9 +26,11 @@ import {
   TIME_TOOL_PROMPT_V2,
   TOOL_SCHEMA_VERSION_V1,
   TOOL_SCHEMA_VERSION_V2,
+  TOOL_SCHEMA_VERSION_V3,
   VOICE_TOOLS,
   VOICE_TOOLS_V1,
   VOICE_TOOLS_V2,
+  VOICE_TOOLS_V3,
   loadApiKeysConfig,
   loadSpikeConfig,
   parseDotEnv,
@@ -49,6 +52,7 @@ import {
   formatStreamErrorReason,
   isDailyRateLimitBody,
   validateCurrentTimeToolCalls,
+  validateCurrentTimeV3ToolCalls,
   validateOrderStatusToolCalls,
   type AssembledToolCall,
   type ParsedStreamResult,
@@ -898,7 +902,10 @@ async function runStreamingChat(opts: ChatRequestOptions): Promise<ChatStreamOut
   };
 }
 
-function executeLocalTool(toolCall: AssembledToolCall): {
+function executeLocalTool(
+  toolCall: AssembledToolCall,
+  sessionTimezone: string = DEFAULT_SESSION_TIMEZONE,
+): {
   readonly output: string;
   readonly execMs: number;
 } {
@@ -906,7 +913,7 @@ function executeLocalTool(toolCall: AssembledToolCall): {
   let payload: Record<string, unknown>;
   if (toolCall.name === "get_current_time") {
     const parsed = CurrentTimeArgsSchema.safeParse(toolCall.parsedArguments);
-    const requestedTz = parsed.success ? (parsed.data.timezone ?? "Asia/Kolkata") : "Asia/Kolkata";
+    const requestedTz = parsed.success ? (parsed.data.timezone ?? sessionTimezone) : sessionTimezone;
     let usedTz = requestedTz;
     let formatted: string;
     try {
@@ -1287,12 +1294,14 @@ async function runToolTurn(
     readonly systemPrompt?: string;
     readonly tools?: readonly OpenAiToolDefinition[];
     readonly serviceTier?: GroqServiceTier;
+    readonly sessionTimezone?: string;
   } = {},
 ): Promise<ToolRunSample> {
   const reasoningEffort =
     probe.reasoningEffort === "not_applicable" ? undefined : probe.reasoningEffort;
   const systemPrompt = options.systemPrompt ?? SYSTEM_PROMPT;
   const tools = options.tools ?? VOICE_TOOLS;
+  const sessionTimezone = options.sessionTimezone ?? DEFAULT_SESSION_TIMEZONE;
 
   const req1 = await runStreamingChat({
     baseUrl: GROQ_BASE_URL,
@@ -1327,7 +1336,7 @@ async function runToolTurn(
     const toolMessages: ChatMessage[] = [];
     let execAccum = 0;
     for (const tc of req1.parsed.toolCalls) {
-      const exec = executeLocalTool(tc);
+      const exec = executeLocalTool(tc, sessionTimezone);
       execAccum += exec.execMs;
       toolMessages.push({
         role: "tool",
@@ -2784,7 +2793,7 @@ async function runTask3dExperiment(): Promise<void> {
       label: "C-time",
       prompt: TIME_TOOL_PROMPT_V2,
       expectTool: "get_current_time",
-      validate: validateCurrentTimeToolCalls,
+      validate: validateCurrentTimeV3ToolCalls,
     },
     {
       id: "c_order",
@@ -2848,7 +2857,11 @@ async function runTask3dExperiment(): Promise<void> {
               p.validate,
               `3d:${key}[${i}]`,
               "auto",
-              { systemPrompt: SYSTEM_PROMPT_V2, tools: VOICE_TOOLS_V2 },
+              {
+                systemPrompt: SYSTEM_PROMPT_V2,
+                tools: VOICE_TOOLS_V3,
+                sessionTimezone: cfg.sessionTimezone,
+              },
             );
             const claimed = detectClaimedCheckWithoutToolCall(
               toolSample.req1Content,
@@ -2883,7 +2896,7 @@ async function runTask3dExperiment(): Promise<void> {
               model: m.model,
               systemPrompt: SYSTEM_PROMPT_V2,
               prompt: p.prompt,
-              tools: VOICE_TOOLS_V2,
+              tools: VOICE_TOOLS_V3,
               toolChoice: "auto",
               reasoningEffort,
               reasoningFormat: m.probe.reasoningFormat,
@@ -2948,7 +2961,7 @@ async function runTask3dExperiment(): Promise<void> {
             model: reliableModel,
             systemPrompt: SYSTEM_PROMPT_V2,
             prompt: PLAIN_PROMPT,
-            tools: VOICE_TOOLS_V2,
+            tools: VOICE_TOOLS_V3,
             toolChoice: "auto",
             reasoningEffort: reliableEffort,
             reasoningFormat: reliableProbe.probe.reasoningFormat,
@@ -2967,7 +2980,7 @@ async function runTask3dExperiment(): Promise<void> {
   }
 
   console.log(
-    `\n=== Task 3d Matrix Results (prompt=${PROMPT_VERSION_V2}, toolSchema=${TOOL_SCHEMA_VERSION_V2}, tool_choice=auto, warm H2, N=${N_TASK3D}, models=${selectedIds.join(",")}) ===`,
+    `\n=== Task 3d Matrix Results (prompt=${PROMPT_VERSION_V2}, toolSchema=${TOOL_SCHEMA_VERSION_V3}, tool_choice=auto, warm H2, N=${N_TASK3D}, models=${selectedIds.join(",")}) ===`,
   );
   const cellSummaries: Array<ReturnType<typeof summarizeTask3dCell>> = [];
   for (const m of modelSpecs) {
@@ -3050,13 +3063,13 @@ async function runTask3dExperiment(): Promise<void> {
     nodeVersion: process.version,
     selectedModels: selectedIds,
     promptVersion: PROMPT_VERSION_V2,
-    toolSchemaVersion: TOOL_SCHEMA_VERSION_V2,
+    toolSchemaVersion: TOOL_SCHEMA_VERSION_V3,
     comparisonBaseline: {
       promptVersion: PROMPT_VERSION,
       toolSchemaVersion: TOOL_SCHEMA_VERSION_V1,
     },
     systemPrompt: SYSTEM_PROMPT_V2,
-    tools: VOICE_TOOLS_V2,
+    tools: VOICE_TOOLS_V3,
     nTask3d: N_TASK3D,
     plannedRequestCounts: {
       qwenPlannedMax,
@@ -3146,6 +3159,7 @@ async function runCtimeDiagnosis(): Promise<void> {
   }> = [
     { id: TOOL_SCHEMA_VERSION_V1, tools: VOICE_TOOLS_V1 },
     { id: TOOL_SCHEMA_VERSION_V2, tools: VOICE_TOOLS_V2 },
+    { id: TOOL_SCHEMA_VERSION_V3, tools: VOICE_TOOLS_V3 },
   ];
   const utterances: ReadonlyArray<{ readonly id: "u1" | "u2"; readonly text: string }> = [
     { id: "u1", text: TIME_TOOL_PROMPT },
@@ -3230,15 +3244,23 @@ async function runCtimeDiagnosis(): Promise<void> {
 
       for (let i = 0; i < nRuns; i += 1) {
         await pacer.waitForModel(model);
+        const validateFn =
+          cell.schemaVersion === TOOL_SCHEMA_VERSION_V3
+            ? validateCurrentTimeV3ToolCalls
+            : validateCurrentTimeToolCalls;
         const sample = await runToolTurn(
           cfg.groqApiKey,
           reliableProbe.probe,
           instr,
           cell.utterance,
-          validateCurrentTimeToolCalls,
+          validateFn,
           `ctime:${cell.key}[${i}]`,
           "auto",
-          { systemPrompt: cell.systemPrompt, tools: cell.tools },
+          {
+            systemPrompt: cell.systemPrompt,
+            tools: cell.tools,
+            sessionTimezone: cfg.sessionTimezone,
+          },
         );
         pacer.recordRequests(model, sample.connectionReq2 ? 2 : 1, 3200);
 
@@ -3311,6 +3333,181 @@ async function runCtimeDiagnosis(): Promise<void> {
   console.log(`\nSaved C-time diagnosis results to ${diagPath}`);
 }
 
+async function runVerifyToolsV3(): Promise<void> {
+  loadEnvFromRoot();
+  const cfg: SpikeEnvConfig = loadSpikeConfig(process.env);
+  const argv = process.argv.slice(2);
+  const nRuns = parseCliIntFlag(argv, "--n", 5);
+  const assumedUsed = parseAssumeUsedArgs(argv);
+  const model = cfg.groqModelReliable;
+
+  const utterances: ReadonlyArray<{ readonly id: "u1" | "u2"; readonly text: string }> = [
+    { id: "u1", text: TIME_TOOL_PROMPT },
+    { id: "u2", text: TIME_TOOL_PROMPT_V2 },
+  ];
+
+  const maxPlannedLoop = utterances.length * nRuns * 2;
+  const tokenBudget = checkGroqTokenBudget(
+    [{ model, plannedRequests: maxPlannedLoop + 1 }],
+    USAGE_LEDGER_PATH,
+    assumedUsed,
+  );
+
+  const groqBase = await measureBaseline("Groq", GROQ_BASE_URL, cfg.groqApiKey);
+  assertModelsPresent("Groq", [model], groqBase.modelIds);
+  const reliableProbe = await probeReasoningSettings(
+    GROQ_BASE_URL,
+    cfg.groqApiKey,
+    model,
+    cfg.groqReliableReasoningEffort ?? "low",
+    true,
+  );
+
+  const plannedMap = new Map<string, number>([["reliable", maxPlannedLoop]]);
+  checkGroqRequestBudget(
+    groqBase.baseline.rateLimitHeaders,
+    [{ role: "reliable", model, probeWithBudget: reliableProbe }],
+    plannedMap,
+    `  Planned tools-v3 verification: ${utterances.length} utterances x N=${nRuns} x up to 2 reqs = ${maxPlannedLoop} max loop requests`,
+  );
+
+  const instr = createInstrumentedAgent(true);
+  const pacer = new PerModelRatePacer();
+  const utteranceSummaries: Array<ReturnType<typeof summarizeToolRuns> & { readonly utteranceId: string; readonly rawArgumentsSamples: readonly string[] }> = [];
+
+  try {
+    await listModels(GROQ_BASE_URL, cfg.groqApiKey, instr.agent);
+    console.log(
+      `\n=== tools-v3 Verification (${model}, prompt=${PROMPT_VERSION_V2}, schema=${TOOL_SCHEMA_VERSION_V3}, tz=${cfg.sessionTimezone}, N=${nRuns}/utterance, warm H2) ===`,
+    );
+
+    for (const u of utterances) {
+      const samples: ToolRunSample[] = [];
+      const rawArgsSamples: string[] = [];
+      for (let i = 0; i < nRuns; i += 1) {
+        await pacer.waitForModel(model);
+        const sample = await runToolTurn(
+          cfg.groqApiKey,
+          reliableProbe.probe,
+          instr,
+          u.text,
+          validateCurrentTimeV3ToolCalls,
+          `v3:${u.id}[${i}]`,
+          "auto",
+          {
+            systemPrompt: SYSTEM_PROMPT_V2,
+            tools: VOICE_TOOLS_V3,
+            sessionTimezone: cfg.sessionTimezone,
+          },
+        );
+        samples.push(sample);
+        pacer.recordRequests(model, sample.connectionReq2 ? 2 : 1, 3200);
+        if (!sample.passed) {
+          console.warn(
+            `    [${u.id} #${i + 1}] FAIL reason=${sample.reason}` +
+              (sample.req1StreamError?.failedGeneration
+                ? ` failed_generation=${sample.req1StreamError.failedGeneration}`
+                : ""),
+          );
+        }
+      }
+      // Also capture one direct inspectable rawArguments sample on u1/u2 via single call?
+      // Better: capture from runStreamingChat or expose toolCalls on ToolRunSample? Wait - let's inspect raw response by running no extra calls; instead check passed count & timings.
+      const summary = summarizeToolRuns(u.id, u.text, "get_current_time", samples);
+      utteranceSummaries.push({ ...summary, utteranceId: u.id, rawArgumentsSamples: rawArgsSamples });
+      printToolSummary(`C-time (${u.id}: "${u.text}")`, summary);
+    }
+  } finally {
+    await instr.close();
+  }
+
+  let geminiCheck: Record<string, unknown> | null = null;
+  if (cfg.geminiApiKey && cfg.geminiModel) {
+    console.log(`\n=== Gemini tools-v3 Schema Check (${cfg.geminiModel}, 1 request) ===`);
+    const gemInstr = createInstrumentedAgent(false);
+    try {
+      await listModels(GEMINI_BASE_URL, cfg.geminiApiKey, gemInstr.agent);
+      const gemEffort =
+        cfg.geminiReasoningEffort ?? "minimal";
+      const gemRes = await runStreamingChat({
+        baseUrl: GEMINI_BASE_URL,
+        apiKey: cfg.geminiApiKey,
+        model: cfg.geminiModel,
+        systemPrompt: SYSTEM_PROMPT_V2,
+        prompt: TIME_TOOL_PROMPT_V2,
+        tools: VOICE_TOOLS_V3,
+        toolChoice: "auto",
+        reasoningEffort: gemEffort,
+        instr: gemInstr,
+      });
+      const validation = validateCurrentTimeV3ToolCalls(
+        gemRes.parsed.toolCalls,
+        gemRes.parsed.streamError,
+      );
+      geminiCheck = {
+        model: cfg.geminiModel,
+        reasoningEffort: gemEffort,
+        prompt: TIME_TOOL_PROMPT_V2,
+        ttftMs: gemRes.ttftMs,
+        toolCallAssembledMs: gemRes.toolCallAssembledMs,
+        totalMs: gemRes.totalMs,
+        finishReason: gemRes.parsed.finishReason,
+        content: gemRes.parsed.content,
+        toolCalls: gemRes.parsed.toolCalls,
+        streamError: gemRes.parsed.streamError,
+        validation,
+      };
+      console.log(
+        `  status=200 | finish_reason=${gemRes.parsed.finishReason ?? "null"} | ` +
+          `t_toolcall=${formatMs(gemRes.toolCallAssembledMs)} | ttft=${formatMs(gemRes.ttftMs)} | ` +
+          `validation=${validation.passed ? "PASS" : `FAIL(${validation.reason})`}`,
+      );
+      console.log(`  toolCalls=${JSON.stringify(gemRes.parsed.toolCalls)}`);
+      if (gemRes.parsed.content.length > 0) {
+        console.log(`  content=${JSON.stringify(gemRes.parsed.content)}`);
+      }
+      if (gemRes.parsed.streamError !== null) {
+        console.log(`  streamError=${JSON.stringify(gemRes.parsed.streamError)}`);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      geminiCheck = {
+        model: cfg.geminiModel,
+        prompt: TIME_TOOL_PROMPT_V2,
+        error: msg,
+      };
+      console.error(`  Gemini tools-v3 request ERROR: ${msg}`);
+    } finally {
+      await gemInstr.close();
+    }
+  } else {
+    console.log("\n=== Gemini tools-v3 Schema Check: skipped (GEMINI_API_KEY not set) ===");
+  }
+
+  mkdirSync(OUT_DIR, { recursive: true });
+  const outPath = path.join(OUT_DIR, "verify-tools-v3.json");
+  writeFileSync(
+    outPath,
+    `${JSON.stringify(
+      {
+        timestamp: new Date().toISOString(),
+        model,
+        promptVersion: PROMPT_VERSION_V2,
+        toolSchemaVersion: TOOL_SCHEMA_VERSION_V3,
+        sessionTimezone: cfg.sessionTimezone,
+        nRunsPerUtterance: nRuns,
+        tokenBudget,
+        utterances: utteranceSummaries,
+        geminiCheck,
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+  console.log(`\nSaved tools-v3 verification results to ${outPath}`);
+}
+
 async function main(): Promise<void> {
   if (process.argv.includes("--list-models")) {
     await printAvailableModels();
@@ -3326,6 +3523,10 @@ async function main(): Promise<void> {
   }
   if (process.argv.includes("--diagnose-ctime")) {
     await runCtimeDiagnosis();
+    return;
+  }
+  if (process.argv.includes("--verify-tools-v3")) {
+    await runVerifyToolsV3();
     return;
   }
 
