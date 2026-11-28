@@ -1,6 +1,6 @@
 # Voice Agent MVP — M1 Design & Contracts
 
-> **Status:** M1 contracts review (no Phase 1 code written yet).  
+> **Status:** Approved for Phase 1 (M1), 2026-11-28. [PROPOSED] items are approved defaults, revisable with measurements.  
 > **Tag legend:** **`[DECIDED]`** = backed by Phase 0 measurements, [claude-handoff-02.md](../handoff/claude-handoff-02.md), spike READMEs, or explicit rulings. **`[PROPOSED]`** = M1 design proposal awaiting final sign-off.
 
 ---

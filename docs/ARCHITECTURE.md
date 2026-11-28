@@ -87,7 +87,7 @@ flowchart LR
   WS <--> Reducer
   Turn --> LLM
   LLM <--> Tools
-  LLM -->|"tokens"| Chunker --> TTS -->|"agent_audio (9B hdr + 24kHz PCM)"| WS
+  LLM -->|"tokens"| Chunker --> TTS -->|"agent_audio (10B hdr + 24kHz PCM)"| WS
   WS -->|"binary frames"| Play
   WS -->|"events & timings"| UI
   Turn --> Metrics
@@ -97,8 +97,8 @@ flowchart LR
 1. **Functional core, imperative shell:** `session/reducer.ts` is pure: `(state, event) => { state, effects }`. `session/runtime.ts` executes side effects.
 2. **Pipeline sees interfaces only:** Vendor SDKs and URLs live strictly in `apps/server/src/adapters/<kind>/<vendor>.ts`. `adapters/factory.ts` is the only module reading `*_PROVIDER` config. Enforced by ESLint `no-restricted-imports`.
 3. **One `AbortController` per turn:** LLM fetch, tool calls, and TTS streaming all observe the same `AbortSignal`. Cancelling a turn is a single `abort()`.
-4. **Turn-tagged outbound audio:** Every server→client `agent_audio` binary frame carries its `turn_id` and `seq`. Client drops frames from cancelled/stale turns immediately.
-5. **Pre-warm at session start:** Open STT/TTS sockets and keep-alive connections on `START_CALL` so turns avoid cold TLS handshakes.
+4. **Turn-tagged outbound audio:** Every server→client `agent_audio` binary frame carries its `turn_id` and `seq`, announced by `audio_start`. Client drops frames from interrupted/stale turns immediately.
+5. **Pre-warm at session start:** Open STT/TTS sockets and keep-alive connections on `session_start` (transitioning `IDLE → LISTENING` on `PREWARM_DONE` + `session_ready`) so turns avoid cold TLS handshakes.
 
 ---
 
@@ -139,56 +139,21 @@ amadeus/
 
 ## 5. Contracts
 
-> Superseded by docs/DESIGN.md (pending approval).
+`docs/DESIGN.md` is the single source of truth for M1 contracts (`packages/protocol/**` and `apps/server/src/adapters/types.ts` are human-owned):
 
-`packages/protocol/**` and `apps/server/src/adapters/types.ts` are human-owned contracts.
-
-### 5.1 Audio Formats
-- **Client → Server:** `PCM16LE`, mono, `16 kHz`, `20 ms` frames (`320` samples = `640` bytes), raw binary WS messages. Capture uses native `AudioContext` rate with low-pass downsample (`48k -> 16k`) in `packages/audio`. Mic constraints: `echoCancellation`, `noiseSuppression`, `autoGainControl` = `true`.
-- **Server VAD (Silero VAD v6.3 — same ONNX I/O as v5: [1,576] input with 64-sample context, [2,1,128] state, int64 sr):** Re-chunked into `512`-sample windows (`32 ms` at 16 kHz). Each ONNX inference call prepends `64` context samples from the end of the previous frame (shape `[1, 576]`), alongside `state` (`[2, 1, 128]`, float32) and `sr` (`16000`, int64).
-- **Server → Client:** `PCM16LE`, mono, `24 kHz`, prefixed by a `9-byte` header: `u8 kind=1 · u32 turn_id · u32 seq` (big/little endian pinned in `packages/protocol`). Playback uses a dedicated `AudioContext({ sampleRate: 24000 })`.
-
-### 5.2 WebSocket Events (`packages/protocol`)
-- **Server → Client:** `state`, `transcript_partial`, `transcript_final`, `agent_text`, `error`, `call_ended`, plus documented extensions `tool_status` and `turn_metrics`.
-- **Client → Server:** `interrupt` (with `turn_id`, `played_ms`, optional `detect_to_stop_ms`), plus documented extensions `end_call` and `playback_done`.
-
-### 5.3 Adapter Interfaces (`adapters/types.ts`)
-- `SttAdapter` / `SttStream`: `write(pcm)`, `onPartial(cb)`, `finalize()`, `close()`. Batch adapters buffer in `write()` and transcribe in `finalize()`.
-- `LlmAdapter`: `stream({ messages, tools, signal }) -> AsyncIterable<LlmChunk>`.
-- `TtsAdapter` / `TtsTurn`: `startTurn(signal) -> { push(sentence), end(), audio: AsyncIterable<Uint8Array> }`.
-- `Tool<A>`: `{ name, description, args: z.ZodType<A>, run(args, ctx) }`.
-- `VadModel`: `{ probability(window512: Float32Array): Promise<number> }`.
-
-### 5.4 Database (SQLite + Drizzle)
-- `sessions`: `id`, `started_at`, `ended_at`, `end_reason`, `config_json`, `prompt_version`
-- `turns`: `session_id`, `turn_id`, `role`, `text`, `spoken_text`, `interrupted`, `created_at`
-- `tool_calls`: `session_id`, `turn_id`, `name`, `args_json`, `result_json`, `ok`, `duration_ms`
-- `turn_metrics`: `session_id`, `turn_id`, `vad_end_ms`, `stt_final_ms`, `llm_first_token_ms`, `first_sentence_ms`, `tts_first_audio_ms`, `total_ms`, `llm_provider`
-- `errors`: `session_id`, `turn_id?`, `stage`, `code`, `message`, `at`
+- **Wire protocol ([`DESIGN.md` §2](DESIGN.md#2-wire-protocol-packagesprotocol-zod-versioned)):** Client sends raw `640 B` `PCM16LE` 16 kHz mono frames (`seq 0` = first frame after `session_ready`). Server sends `10 B` LE header (`u8 kind=1`, `u8 version=1`, `u32 turn_id`, `u32 seq`) + `PCM16LE` 24 kHz mono frames, bracketed by `audio_start { turn_id, kind, seq }` and `agent_audio_end { turn_id, total_bytes }`, plus Zod-validated JSON events.
+- **Adapter interfaces ([`DESIGN.md` §4](DESIGN.md#4-adapter-interfaces-appsserversrcadapterstypests)):** Call-scoped `VadSession`, `SttSession`, and `TtsSession` (`startTurn(turnId, signal)`), turn-scoped `LlmAdapter.stream(..., signal)`, and `Tool<TArgs>`, plus keyless `Fake*` adapters and batch/REST swap proofs.
+- **Persistence & API ([`DESIGN.md` §8](DESIGN.md#8-persistence-sqlite--drizzle--get-sessionsid)):** SQLite + Drizzle tables (`sessions`, `turns` with `kind: "reply" | "clip"`, `tool_calls`, `turn_metrics` with nullable `t0_seq`, `errors`) flushed per turn so `GET /sessions/:id` works live and post-call.
 
 ---
 
 ## 6. Turn Lifecycle & Barge-In
 
-> Superseded by docs/DESIGN.md (pending approval).
+See [`DESIGN.md` §3](DESIGN.md#3-session-reducer-appsserversrcsessionreducerts), [`§7`](DESIGN.md#7-barge-in-history--spoken-form-normalization), and [`§9`](DESIGN.md#9-provider-connection-lifecycle-decided) for the full state table, guard classes, and provider lifecycle:
 
-- **State Machine (`session/reducer.ts`):**
-  - `IDLE` + `START_CALL` → `LISTENING`
-  - `LISTENING` + `VAD_START` → `LISTENING` (forward pre-roll audio from `start − 100 ms`, stream frames to STT)
-  - `LISTENING` + `VAD_END` → `LISTENING` (`stt.finalize()`, mark `t_vad_end`)
-  - `LISTENING` + `STT_FINAL` (empty/noise) → `LISTENING` (drop)
-  - `LISTENING` + `STT_FINAL` (text) → `THINKING` (append user turn, start LLM)
-  - `THINKING` + `VAD_START` → `LISTENING` (abort turn, merge next final with prior user text)
-  - `THINKING` + `FIRST_AUDIO` → `SPEAKING`
-  - `SPEAKING` + `PLAYBACK_DONE` → `LISTENING` (commit agent turn)
-  - `SPEAKING` + `INTERRUPT` → `LISTENING` (abort turn, commit `spoken_text` via `played_ms`, `interrupted = true`)
-  - `any` + `STAGE_ERROR` → `LISTENING` (play cached fallback clip, log error)
-  - `any` + `END_CALL` / `SILENCE_2MIN` / `MAX_DURATION` / `WS_CLOSE` → `ENDED`
-- **VAD Settings:** `0.5` onset / `0.35` offset hysteresis, `250 ms` min speech, `550 ms` end-of-utterance silence (configurable `500–700 ms`), 500 ms pre-roll ring buffer; on `speech_start`, forward audio to STT from `(start − 100 ms)`. Measured `onsetConfirmMs` = 256 ms (8 × 32 ms windows), so the buffer must exceed `onsetConfirmMs` + padding. `30 s` max utterance. Send Deepgram `KeepAlive` outside speech.
-- **STT:** Deepgram Nova-3 with `interim_results=true`, `Finalize` on VAD end (plus `300 ms` settle timeout). Do not rely on Deepgram endpointing (`10 ms` default); treat `is_final` messages as fragments accumulated until VAD end.
-- **LLM & Tools:** System prompt + last 20 messages + transcript, `max_tokens ~ 150`. Max 2 tool rounds/turn with `3 s` tool timeout (`get_order_status`, `get_current_time`). Failover to Gemini only before first content token.
-- **Sentence Chunker (pure):** Split on `. ? !` + whitespace/EOS once ≥ 12 chars; ignore decimals & abbreviations (`Dr.`, `e.g.`, `etc.`, `no.`); first-clause flush on `, ; :` once ≥ 40 chars; strip markdown.
-- **Barge-In:** Client `vad-web` ducks volume to 20% on suspicion, confirms after ~150 ms, clears playback worklet, and sends `interrupt` with `played_ms` and `detect_to_stop_ms`. Server maps `played_ms` to per-sentence durations to store honest `spoken_text`.
+- **Reducer & scopes:** Pure `(state, event) => { state, effects }` over `IDLE → LISTENING ↔ THINKING ↔ SPEAKING → ENDED` (`PREWARM_DONE` emits `session_ready`), with monotonic `captureTurnId` (open speech) and `activeTurnId` (thinking/playing), generation-guarded timers, and `goodbyeTurnId` drain guard.
+- **VAD, STT & chunker:** Silero v6.3 (`0.5/0.35`, `256 ms` confirm, `576 ms` VAD end, `500 ms` pre-roll burst from `start − 100 ms`), Deepgram Nova-3 (`Finalize` on `VAD_END`, `KeepAlive` every `~5 s` between turns only on STT), and pure sentence chunker + deterministic spoken-form ID rewriting (`"1042"` → `"1 0 4 2"`).
+- **Barge-in & echo:** Client `@ricky0123/vad-web` stops playback and sends `interrupt { turn_id, played_ms, detect_to_stop_ms }` for proportional heard-text truncation; server runs provisional echo carry-over (`echoSuspect` + `VOICED_AFTER_REF` at `250 ms`) and `Clear` + WS `ping` (`~20 s`, never `KeepAlive`) on Deepgram TTS `/v1/speak`.
 
 ---
 
@@ -209,16 +174,11 @@ Measured Phase 0 medians (server local in India): `576 + 80 + 447 + ≤ 48 + 107
 
 ## 8. Error Handling Matrix
 
-> Superseded by docs/DESIGN.md (pending approval).
+See [`DESIGN.md` §6](DESIGN.md#6-error-matrix--timeouts) for the full 18-row failure matrix and `~10×` p90 timeouts:
 
-- **Mic denied:** Request mic permission *before* `POST /sessions` so no orphaned session is created; show banner.
-- **STT error / 1.5 s Finalize timeout:** Play pre-rendered fallback clip (*"Sorry, I didn't catch that, could you repeat?"*); reconnect in background; log error.
-- **LLM error / 429 / 3 s timeout:** Failover to Gemini if pre-first-token; otherwise fallback clip.
-- **TTS error / 2 s timeout:** Play pre-rendered fallback clip (zero TTS dependency); reconnect.
-- **WS drop / 2 missed pings (10 s):** Client shows `"Disconnected"`; server aborts turn, marks `ws_drop`, persists DB.
-- **Noise-only (< 250 ms or empty transcript):** Ignore; no LLM call.
-- **Tool fails / 3 s timeout:** Return `{ error }` to LLM so it apologizes gracefully.
-- **Silence (2 min) / Max duration:** Play goodbye clip, emit `call_ended`, close sockets.
+- **Timeouts:** `stt_final` `1000 ms`, `llm_first_token` `2000 ms`, `llm_budget` `3500 ms`, `tool` `3000 ms`, `tts_first_audio` `1500 ms`, `tts_stall` `2000 ms`, `goodbye_close` `clip_ms + 1000 ms`, `silence` `120 s`, `max_call` `600 s`.
+- **Failover & retries:** Pre-warm retries once (`PREWARM_FAILED` → `internal_error` with zero audio); `tool_use_failed` retries once on the same model; pre-first-token LLM errors/429s fail over `gpt-oss-120b → gpt-oss-20b → gemini-3.5-flash-lite` within `3500 ms` `llm_budget`.
+- **Clips & protocol:** Recoverable active-turn failures flush metrics once (`outcome = "fallback" | "failed"`) and play a pre-rendered fallback clip (`kind = "clip"`); `silence`/`max_call` play the goodbye clip under `goodbyeTurnId`; bad sequence (`MIC_FRAME` before `session_ready`), `len !== 640`, or version mismatch close WS immediately.
 
 ---
 
