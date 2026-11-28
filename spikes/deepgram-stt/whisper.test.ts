@@ -5,15 +5,15 @@ import { transcribeWithGroqWhisper, type FetchLike } from "./whisper.js";
 describe("whisper", () => {
   it("uploads WAV multipart form and returns transcript + headers", async () => {
     let seenUrl = "";
-    let seenModel = "";
-    let seenFileBytes = 0;
+    let seenContentType = "";
+    let seenBodyText = "";
 
     const mockFetch: FetchLike = async (input, init) => {
       seenUrl = String(input);
-      const form = init?.body as FormData;
-      seenModel = String(form.get("model"));
-      const file = form.get("file") as Blob;
-      seenFileBytes = file.size;
+      const headers = new Headers(init?.headers as Record<string, string> | undefined);
+      seenContentType = headers.get("content-type") ?? "";
+      const bodyBytes = init?.body as Uint8Array;
+      seenBodyText = Buffer.from(bodyBytes).toString("latin1");
 
       return new Response(
         JSON.stringify({
@@ -40,8 +40,10 @@ describe("whisper", () => {
     });
 
     expect(seenUrl).toContain("/audio/transcriptions");
-    expect(seenModel).toBe("whisper-large-v3-turbo");
-    expect(seenFileBytes).toBe(44 + 640);
+    expect(seenContentType).toMatch(/^multipart\/form-data; boundary=/);
+    expect(seenBodyText).toContain('name="model"\r\n\r\nwhisper-large-v3-turbo');
+    expect(seenBodyText).toContain('filename="turn.wav"');
+    expect(seenBodyText).toContain("RIFF");
     expect(out.transcript).toBe("Hello, can you check the status of order 1042?");
     expect(out.reportedDurationSec).toBe(4.2);
     expect(out.groqRegion).toBe("bom");

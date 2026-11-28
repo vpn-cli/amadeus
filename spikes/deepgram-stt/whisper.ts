@@ -143,6 +143,55 @@ function extractRateLimitHeaders(headers: Response["headers"]): Record<string, s
 }
 
 /**
+ * Builds a RFC 7578 multipart/form-data payload explicitly so Content-Type and
+ * Content-Length work identically across Node/undici HTTP/1.1 and HTTP/2.
+ */
+export function buildWhisperMultipartBody(options: {
+  readonly wavBuffer: Uint8Array;
+  readonly model: string;
+  readonly language: string;
+  readonly responseFormat?: string;
+  readonly boundary?: string;
+}): { readonly contentType: string; readonly body: Buffer } {
+  const boundary =
+    options.boundary ?? `----AmadeusWhisperBoundary${Math.random().toString(36).slice(2)}`;
+  const fields: ReadonlyArray<readonly [string, string]> = [
+    ["model", options.model],
+    ["language", options.language],
+    ["response_format", options.responseFormat ?? "verbose_json"],
+  ];
+
+  const parts: Buffer[] = [];
+  for (const [name, value] of fields) {
+    parts.push(
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`,
+        "utf8",
+      ),
+    );
+  }
+  parts.push(
+    Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="turn.wav"\r\nContent-Type: audio/wav\r\n\r\n`,
+      "utf8",
+    ),
+  );
+  parts.push(
+    Buffer.from(
+      options.wavBuffer.buffer,
+      options.wavBuffer.byteOffset,
+      options.wavBuffer.byteLength,
+    ),
+  );
+  parts.push(Buffer.from(`\r\n--${boundary}--\r\n`, "utf8"));
+
+  return {
+    contentType: `multipart/form-data; boundary=${boundary}`,
+    body: Buffer.concat(parts),
+  };
+}
+
+/**
  * Transcribes a PCM16LE 16 kHz slice via Groq's batch /audio/transcriptions REST endpoint.
  * Measures request start -> parsed transcript as the batch equivalent of stt_final.
  */
@@ -163,26 +212,27 @@ export async function transcribeWithGroqWhisper(options: {
   const maxRetries = options.maxRateLimitRetries ?? 3;
 
   const wavBuffer = encodePcm16Wav(options.pcmBytes, 16000, 1);
+  const multipart = buildWhisperMultipartBody({
+    wavBuffer,
+    model,
+    language,
+    responseFormat: "verbose_json",
+  });
 
   let res: Response | null = null;
   let tStart = 0;
   let connectStartIdx = 0;
 
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
-    const form = new FormData();
-    form.append("file", new Blob([new Uint8Array(wavBuffer)], { type: "audio/wav" }), "turn.wav");
-    form.append("model", model);
-    form.append("language", language);
-    form.append("response_format", "verbose_json");
-
     connectStartIdx = options.instr?.getConnectEventsCount() ?? 0;
     tStart = performance.now();
     res = await fetchImpl(url, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${options.apiKey}`,
+        "Content-Type": multipart.contentType,
       },
-      body: form,
+      body: new Uint8Array(multipart.body),
       ...(options.instr ? { dispatcher: options.instr.dispatcher } : {}),
     });
 
