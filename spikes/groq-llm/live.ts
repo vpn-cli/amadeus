@@ -7,10 +7,13 @@ import { fileURLToPath } from "node:url";
 import { Agent, buildConnector, fetch, type Dispatcher, type Response } from "undici";
 import { ZodError } from "zod";
 import {
+  CurrentTimeArgsSchema,
+  ORDER_TOOL_PROMPT,
+  OrderStatusArgsSchema,
   PLAIN_PROMPT,
   PROMPT_VERSION,
   SYSTEM_PROMPT,
-  TOOL_PROMPT,
+  TIME_TOOL_PROMPT,
   VOICE_TOOLS,
   loadApiKeysConfig,
   loadSpikeConfig,
@@ -23,8 +26,11 @@ import { SseParser } from "./sse.js";
 import { formatMs, formatPct, summarize, type DistributionStats } from "./stats.js";
 import {
   GroqStreamAccumulator,
+  validateCurrentTimeToolCalls,
   validateOrderStatusToolCalls,
+  type AssembledToolCall,
   type ParsedStreamResult,
+  type ToolValidationResult,
 } from "./stream-parser.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -79,10 +85,32 @@ function computeRateLimitWaitMs(res: Response, bodyText: string): number {
 
 type HttpProtocol = "h1" | "h2" | "unknown";
 
+interface SocketConnectEvent {
+  readonly dnsMs: number;
+  readonly tcpMs: number;
+  readonly tlsMs: number;
+  readonly totalConnectMs: number;
+  readonly protocol: HttpProtocol;
+  readonly reusedTlsSession: boolean;
+}
+
+interface RequestConnectionMetrics {
+  readonly newSocket: boolean;
+  readonly socketsOpened: number;
+  readonly dnsMs: number;
+  readonly tcpMs: number;
+  readonly tlsMs: number;
+  readonly totalConnectMs: number;
+  readonly protocol: HttpProtocol;
+  readonly reusedTlsSession: boolean;
+}
+
 interface InstrumentedAgent {
   readonly agent: Agent;
   readonly getConnectCount: () => number;
   readonly getSocketCount: () => number;
+  readonly getConnectEventsCount: () => number;
+  readonly getConnectEventsSince: (startIndex: number) => readonly SocketConnectEvent[];
   readonly getLastProtocol: () => HttpProtocol;
   readonly close: () => Promise<void>;
 }
@@ -110,6 +138,7 @@ interface PlainRunSample {
   readonly totalMs: number;
   readonly reasoningTokens: number;
   readonly wronglyCalledTool: boolean;
+  readonly connection: RequestConnectionMetrics;
   readonly protocol: HttpProtocol;
   readonly cfRayLocation: string | null;
   readonly rateLimitHeaders: Record<string, string>;
@@ -120,12 +149,22 @@ interface ToolRunSample {
   readonly calledAnyTool: boolean;
   readonly calledExpectedTool: boolean;
   readonly validJsonArgs: boolean;
+  readonly validArgsSchema: boolean;
   readonly correctOrderId: boolean;
   readonly reason: string | null;
   readonly emittedContentBeforeToolCall: boolean;
   readonly preToolContentTtftMs: number | null;
+  readonly tToolCallMs: number | null;
+  readonly tExecMs: number | null;
+  readonly followupTtftMs: number | null;
+  readonly followupFirstSentenceAbsMs: number | null;
+  readonly followupSucceeded: boolean;
+  readonly e2eMs: number | null;
   readonly totalMs: number;
-  readonly reasoningTokens: number;
+  readonly reasoningTokensReq1: number;
+  readonly reasoningTokensReq2: number;
+  readonly connectionReq1: RequestConnectionMetrics;
+  readonly connectionReq2: RequestConnectionMetrics | null;
   readonly protocol: HttpProtocol;
   readonly cfRayLocation: string | null;
   readonly rateLimitHeaders: Record<string, string>;
@@ -137,9 +176,24 @@ interface CancelCycleSample {
   readonly postAbortTtftMs: number | null;
   readonly newAgentConnections: number;
   readonly newSocketConnects: number;
+  readonly abortedConnection: RequestConnectionMetrics;
+  readonly followUpConnection: RequestConnectionMetrics;
   readonly protocol: HttpProtocol;
   readonly cfRayLocation: string | null;
 }
+
+type ChatMessage =
+  | { readonly role: "system" | "user"; readonly content: string }
+  | {
+      readonly role: "assistant";
+      readonly content: string | null;
+      readonly tool_calls: ReadonlyArray<{
+        readonly id: string;
+        readonly type: string;
+        readonly function: { readonly name: string; readonly arguments: string };
+      }>;
+    }
+  | { readonly role: "tool"; readonly tool_call_id: string; readonly content: string };
 
 function loadEnvFromRoot(): void {
   const candidates = [path.join(REPO_ROOT, ".env"), path.join(__dirname, ".env")];
@@ -154,36 +208,77 @@ function loadEnvFromRoot(): void {
   }
 }
 
-function createInstrumentedAgent(allowH2: boolean): InstrumentedAgent {
+function createInstrumentedAgent(
+  allowH2: boolean,
+  options: { readonly disableSessionCache?: boolean } = {},
+): InstrumentedAgent {
   let agentConnectCount = 0;
   let socketConnectCount = 0;
   let lastProtocol: HttpProtocol = "unknown";
+  const connectEvents: SocketConnectEvent[] = [];
 
-  const baseConnector = buildConnector({ allowH2, keepAlive: true });
+  const baseConnector = buildConnector({
+    allowH2,
+    keepAlive: true,
+    ...(options.disableSessionCache ? { maxCachedSessions: 0 } : {}),
+  });
   const instrumentedConnector: buildConnector.connector = (opts, callback) => {
-    baseConnector(opts, (err, socket) => {
-      if (err) {
+    const t0 = performance.now();
+    let tLookup: number | null = null;
+    let tTcp: number | null = null;
+    const isHttps = opts.protocol === "https:";
+
+    const pendingSocket = baseConnector(opts, (err, socket) => {
+      const tDone = performance.now();
+      if (err || !socket) {
         callback(err, null);
         return;
       }
       socketConnectCount += 1;
       const tlsSock = socket as Partial<TLSSocket>;
+      let protocol: HttpProtocol;
       if (tlsSock.alpnProtocol === "h2") {
-        lastProtocol = "h2";
+        protocol = "h2";
       } else if (tlsSock.alpnProtocol === "http/1.1" || tlsSock.alpnProtocol === false) {
-        lastProtocol = "h1";
+        protocol = "h1";
       } else {
-        lastProtocol = allowH2 ? "unknown" : "h1";
+        protocol = allowH2 ? "unknown" : "h1";
       }
+      lastProtocol = protocol;
+
+      const dnsMs = tLookup !== null ? Math.max(0, tLookup - t0) : 0;
+      const tcpMs = tTcp !== null ? Math.max(0, tTcp - (tLookup ?? t0)) : 0;
+      const tlsMs = isHttps ? Math.max(0, tDone - (tTcp ?? tLookup ?? t0)) : 0;
+      const totalConnectMs = Math.max(0, tDone - t0);
+      const reusedTlsSession =
+        typeof tlsSock.isSessionReused === "function" ? tlsSock.isSessionReused() : false;
+
+      connectEvents.push({
+        dnsMs,
+        tcpMs,
+        tlsMs,
+        totalConnectMs,
+        protocol,
+        reusedTlsSession,
+      });
       callback(null, socket);
-    });
+    }) as unknown as net.Socket | undefined;
+
+    if (pendingSocket && typeof pendingSocket.once === "function") {
+      pendingSocket.once("lookup", () => {
+        tLookup = performance.now();
+      });
+      pendingSocket.once("connect", () => {
+        tTcp = performance.now();
+      });
+    }
   };
 
   const agent = new Agent({
     allowH2,
     connect: instrumentedConnector,
-    keepAliveTimeout: 30_000,
-    keepAliveMaxTimeout: 60_000,
+    keepAliveTimeout: 120_000,
+    keepAliveMaxTimeout: 300_000,
   });
   agent.on("connect", (_origin: URL, _targets: readonly Dispatcher[]) => {
     agentConnectCount += 1;
@@ -193,6 +288,8 @@ function createInstrumentedAgent(allowH2: boolean): InstrumentedAgent {
     agent,
     getConnectCount: () => agentConnectCount,
     getSocketCount: () => socketConnectCount,
+    getConnectEventsCount: () => connectEvents.length,
+    getConnectEventsSince: (startIndex: number) => connectEvents.slice(startIndex),
     getLastProtocol: () => lastProtocol,
     close: () => agent.close(),
   };
@@ -274,8 +371,9 @@ async function listModels(
     }>;
   };
   const models: ListedModelInfo[] = (parsed.data ?? [])
-    .filter((m): m is { id: string; owned_by?: string; active?: boolean; context_window?: number } =>
-      typeof m.id === "string" && m.id.length > 0,
+    .filter(
+      (m): m is { id: string; owned_by?: string; active?: boolean; context_window?: number } =>
+        typeof m.id === "string" && m.id.length > 0,
     )
     .map((m) => ({
       id: m.id,
@@ -346,39 +444,96 @@ interface ChatRequestOptions {
   readonly baseUrl: string;
   readonly apiKey: string;
   readonly model: string;
-  readonly prompt: string;
+  readonly prompt?: string;
+  readonly messages?: readonly ChatMessage[];
   readonly tools: typeof VOICE_TOOLS | undefined;
   readonly reasoningEffort?: ReasoningEffort | undefined;
   readonly reasoningFormat?: "parsed" | "default" | undefined;
-  readonly dispatcher: Agent;
+  readonly instr: InstrumentedAgent;
   readonly maxTokens?: number;
   readonly abortOnFirstContent?: boolean;
 }
 
 interface ChatStreamOutcome {
   readonly parsed: ParsedStreamResult;
+  readonly startTimestampMs: number;
+  readonly firstContentTimestampMs: number | null;
   readonly ttftMs: number | null;
+  readonly toolCallAssembledMs: number | null;
   readonly firstSentenceAbsMs: number | null;
   readonly firstSentenceRelMs: number | null;
   readonly totalMs: number;
   readonly deltasAfterAbort: number;
   readonly aborted: boolean;
+  readonly connection: RequestConnectionMetrics;
   readonly cfRayLocation: string | null;
   readonly rateLimitHeaders: Record<string, string>;
 }
 
+function buildConnectionMetrics(
+  events: readonly SocketConnectEvent[],
+  fallbackProtocol: HttpProtocol,
+): RequestConnectionMetrics {
+  const first = events[0];
+  if (first === undefined) {
+    return {
+      newSocket: false,
+      socketsOpened: 0,
+      dnsMs: 0,
+      tcpMs: 0,
+      tlsMs: 0,
+      totalConnectMs: 0,
+      protocol: fallbackProtocol,
+      reusedTlsSession: false,
+    };
+  }
+  return {
+    newSocket: true,
+    socketsOpened: events.length,
+    dnsMs: first.dnsMs,
+    tcpMs: first.tcpMs,
+    tlsMs: first.tlsMs,
+    totalConnectMs: first.totalConnectMs,
+    protocol: first.protocol,
+    reusedTlsSession: first.reusedTlsSession,
+  };
+}
+
+function assertColdConnection(label: string, conn: RequestConnectionMetrics): void {
+  if (!conn.newSocket || conn.socketsOpened !== 1) {
+    throw new Error(
+      `Cold connection bug (${label}): expected 1 new socket, got newSocket=${conn.newSocket} socketsOpened=${conn.socketsOpened}`,
+    );
+  }
+  if (conn.tlsMs <= 0) {
+    throw new Error(
+      `Cold connection bug (${label}): expected non-zero TLS handshake ms, got tlsMs=${conn.tlsMs}`,
+    );
+  }
+}
+
+function assertWarmConnection(label: string, conn: RequestConnectionMetrics): void {
+  if (conn.newSocket || conn.socketsOpened !== 0) {
+    throw new Error(
+      `Warm connection bug (${label}): expected socket reuse (0 new sockets), got newSocket=${conn.newSocket} socketsOpened=${conn.socketsOpened}`,
+    );
+  }
+}
+
 async function runStreamingChat(opts: ChatRequestOptions): Promise<ChatStreamOutcome> {
   const controller = new AbortController();
+  const messages: readonly ChatMessage[] =
+    opts.messages ?? [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content: opts.prompt ?? PLAIN_PROMPT },
+    ];
   const bodyObj: Record<string, unknown> = {
     model: opts.model,
     stream: true,
     stream_options: { include_usage: true },
     temperature: 0.2,
     max_tokens: opts.maxTokens ?? 150,
-    messages: [
-      { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: opts.prompt },
-    ],
+    messages,
   };
   if (opts.tools !== undefined) {
     bodyObj.tools = opts.tools;
@@ -392,7 +547,9 @@ async function runStreamingChat(opts: ChatRequestOptions): Promise<ChatStreamOut
 
   let res: Response | null = null;
   let tStart = 0;
+  let connectEventsStartIdx = 0;
   for (let attempt = 0; attempt <= MAX_RATE_LIMIT_RETRIES; attempt += 1) {
+    connectEventsStartIdx = opts.instr.getConnectEventsCount();
     tStart = performance.now();
     res = await fetch(`${opts.baseUrl}/chat/completions`, {
       method: "POST",
@@ -401,7 +558,7 @@ async function runStreamingChat(opts: ChatRequestOptions): Promise<ChatStreamOut
         "Content-Type": "application/json",
       },
       body: JSON.stringify(bodyObj),
-      dispatcher: opts.dispatcher,
+      dispatcher: opts.instr.agent,
       signal: controller.signal,
     });
 
@@ -410,10 +567,14 @@ async function runStreamingChat(opts: ChatRequestOptions): Promise<ChatStreamOut
     }
     const errText = await res.text();
     if (attempt === MAX_RATE_LIMIT_RETRIES) {
-      throw new Error(`POST ${opts.baseUrl}/chat/completions (${opts.model}) failed ${res.status}: ${errText}`);
+      throw new Error(
+        `POST ${opts.baseUrl}/chat/completions (${opts.model}) failed ${res.status}: ${errText}`,
+      );
     }
     const waitMs = computeRateLimitWaitMs(res, errText);
-    console.warn(`[RateLimit] 429 on ${opts.model} (attempt ${attempt + 1}/${MAX_RATE_LIMIT_RETRIES}), waiting ${waitMs} ms`);
+    console.warn(
+      `[RateLimit] 429 on ${opts.model} (attempt ${attempt + 1}/${MAX_RATE_LIMIT_RETRIES}), waiting ${waitMs} ms`,
+    );
     await sleep(waitMs);
   }
 
@@ -422,7 +583,9 @@ async function runStreamingChat(opts: ChatRequestOptions): Promise<ChatStreamOut
   }
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`POST ${opts.baseUrl}/chat/completions (${opts.model}) failed ${res.status}: ${errText}`);
+    throw new Error(
+      `POST ${opts.baseUrl}/chat/completions (${opts.model}) failed ${res.status}: ${errText}`,
+    );
   }
   if (!res.body) {
     throw new Error("Response body was null");
@@ -435,7 +598,10 @@ async function runStreamingChat(opts: ChatRequestOptions): Promise<ChatStreamOut
   const acc = new GroqStreamAccumulator();
   const splitter = new SentenceSplitter();
 
+  let firstContentTimestampMs: number | null = null;
   let ttftMs: number | null = null;
+  let toolCallAssembledMs: number | null = null;
+  let lastToolDeltaTimestampMs: number | null = null;
   let firstSentenceAbsMs: number | null = null;
   let abortedAtMs: number | null = null;
   let deltasAfterAbort = 0;
@@ -454,7 +620,14 @@ async function runStreamingChat(opts: ChatRequestOptions): Promise<ChatStreamOut
         }
         const step = acc.pushEventData(evt.data);
         if (step.done) continue;
+        if (step.hasToolCallDelta) {
+          lastToolDeltaTimestampMs = now;
+        }
+        if (step.finishReason === "tool_calls" && toolCallAssembledMs === null) {
+          toolCallAssembledMs = now - tStart;
+        }
         if (step.isFirstContentDelta && ttftMs === null) {
+          firstContentTimestampMs = now;
           ttftMs = now - tStart;
         }
         if (step.contentDelta.length > 0) {
@@ -479,15 +652,26 @@ async function runStreamingChat(opts: ChatRequestOptions): Promise<ChatStreamOut
     }
   } finally {
     if (abortedAtMs !== null) {
-      // Cancel/release reader cleanly and allow microtasks to flush any in-flight events.
       await reader.cancel().catch(() => undefined);
     } else {
+      const flushNow = performance.now();
       for (const evt of sse.flush()) {
         const step = acc.pushEventData(evt.data);
-        if (!step.done && step.contentDelta.length > 0) {
+        if (step.done) continue;
+        if (step.hasToolCallDelta) {
+          lastToolDeltaTimestampMs = flushNow;
+        }
+        if (step.finishReason === "tool_calls" && toolCallAssembledMs === null) {
+          toolCallAssembledMs = flushNow - tStart;
+        }
+        if (step.isFirstContentDelta && ttftMs === null) {
+          firstContentTimestampMs = flushNow;
+          ttftMs = flushNow - tStart;
+        }
+        if (step.contentDelta.length > 0) {
           const sentences = splitter.push(step.contentDelta);
           if (sentences.length > 0 && firstSentenceAbsMs === null) {
-            firstSentenceAbsMs = performance.now() - tStart;
+            firstSentenceAbsMs = flushNow - tStart;
           }
         }
       }
@@ -499,20 +683,74 @@ async function runStreamingChat(opts: ChatRequestOptions): Promise<ChatStreamOut
   }
 
   const totalMs = performance.now() - tStart;
+  const parsed = acc.result();
+  if (toolCallAssembledMs === null && parsed.toolCalls.length > 0) {
+    toolCallAssembledMs =
+      lastToolDeltaTimestampMs !== null ? lastToolDeltaTimestampMs - tStart : totalMs;
+  }
+
   const firstSentenceRelMs =
     firstSentenceAbsMs !== null && ttftMs !== null ? firstSentenceAbsMs - ttftMs : null;
+  const connection = buildConnectionMetrics(
+    opts.instr.getConnectEventsSince(connectEventsStartIdx),
+    opts.instr.getLastProtocol(),
+  );
 
   return {
-    parsed: acc.result(),
+    parsed,
+    startTimestampMs: tStart,
+    firstContentTimestampMs,
     ttftMs,
+    toolCallAssembledMs,
     firstSentenceAbsMs,
     firstSentenceRelMs,
     totalMs,
     deltasAfterAbort,
     aborted: abortedAtMs !== null,
+    connection,
     cfRayLocation,
     rateLimitHeaders,
   };
+}
+
+function executeLocalTool(toolCall: AssembledToolCall): {
+  readonly output: string;
+  readonly execMs: number;
+} {
+  const t0 = performance.now();
+  let payload: Record<string, unknown>;
+  if (toolCall.name === "get_current_time") {
+    const parsed = CurrentTimeArgsSchema.safeParse(toolCall.parsedArguments);
+    const requestedTz = parsed.success ? (parsed.data.timezone ?? "UTC") : "UTC";
+    let usedTz = requestedTz;
+    let formatted: string;
+    try {
+      formatted = new Intl.DateTimeFormat("en-US", {
+        timeZone: requestedTz,
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: true,
+      }).format(new Date());
+    } catch {
+      usedTz = "UTC";
+      formatted = new Intl.DateTimeFormat("en-US", {
+        timeZone: "UTC",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: true,
+      }).format(new Date());
+    }
+    payload = { time: formatted, timezone: usedTz };
+  } else if (toolCall.name === "get_order_status") {
+    const parsed = OrderStatusArgsSchema.safeParse(toolCall.parsedArguments);
+    const orderId = parsed.success ? parsed.data.order_id : "unknown";
+    payload = { order_id: orderId, status: "shipped", eta: "tomorrow by 6 PM" };
+  } else {
+    payload = { error: `Unknown tool: ${toolCall.name}` };
+  }
+  const output = JSON.stringify(payload);
+  const execMs = performance.now() - t0;
+  return { output, execMs };
 }
 
 async function probeReasoningSettings(
@@ -526,7 +764,7 @@ async function probeReasoningSettings(
   try {
     if (overrideEffort !== undefined) {
       let reasoningFormat: "parsed" | "default" = "default";
-      if (allowReasoningFormat) {
+      if (allowReasoningFormat && overrideEffort !== "none") {
         try {
           await runStreamingChat({
             baseUrl,
@@ -536,7 +774,7 @@ async function probeReasoningSettings(
             tools: undefined,
             reasoningEffort: overrideEffort,
             reasoningFormat: "parsed",
-            dispatcher: instr.agent,
+            instr,
             maxTokens: 16,
           });
           reasoningFormat = "parsed";
@@ -548,10 +786,21 @@ async function probeReasoningSettings(
             prompt: "Say ok.",
             tools: undefined,
             reasoningEffort: overrideEffort,
-            dispatcher: instr.agent,
+            instr,
             maxTokens: 16,
           });
         }
+      } else {
+        await runStreamingChat({
+          baseUrl,
+          apiKey,
+          model,
+          prompt: "Say ok.",
+          tools: undefined,
+          reasoningEffort: overrideEffort,
+          instr,
+          maxTokens: 16,
+        });
       }
       return {
         model,
@@ -561,14 +810,13 @@ async function probeReasoningSettings(
       };
     }
 
-    // Default probe without reasoning_effort to detect whether the model reasons by default.
     const defaultProbe = await runStreamingChat({
       baseUrl,
       apiKey,
       model,
       prompt: "Reply with the word ok.",
       tools: undefined,
-      dispatcher: instr.agent,
+      instr,
       maxTokens: 24,
     });
     const hasReasoning =
@@ -577,7 +825,6 @@ async function probeReasoningSettings(
       defaultProbe.parsed.content.includes("<think>");
 
     if (!hasReasoning) {
-      // Also check if Gemini-style thinking models accept minimal/none even when maxTokens=24 emitted 0 reasoning tokens.
       if (!allowReasoningFormat) {
         for (const effort of ["none", "minimal", "low"] as const) {
           try {
@@ -588,7 +835,7 @@ async function probeReasoningSettings(
               prompt: "Reply with ok.",
               tools: undefined,
               reasoningEffort: effort,
-              dispatcher: instr.agent,
+              instr,
               maxTokens: 16,
             });
             return {
@@ -612,7 +859,7 @@ async function probeReasoningSettings(
 
     const efforts: readonly ReasoningEffort[] = ["none", "minimal", "low"];
     for (const effort of efforts) {
-      if (allowReasoningFormat) {
+      if (allowReasoningFormat && effort !== "none") {
         try {
           await runStreamingChat({
             baseUrl,
@@ -622,7 +869,7 @@ async function probeReasoningSettings(
             tools: undefined,
             reasoningEffort: effort,
             reasoningFormat: "parsed",
-            dispatcher: instr.agent,
+            instr,
             maxTokens: 16,
           });
           return {
@@ -643,12 +890,12 @@ async function probeReasoningSettings(
           prompt: "Reply with ok.",
           tools: undefined,
           reasoningEffort: effort,
-          dispatcher: instr.agent,
+          instr,
           maxTokens: 16,
         });
         return {
           model,
-          isReasoningModel: true,
+          isReasoningModel: effort !== "none",
           reasoningEffort: effort,
           reasoningFormat: "default",
         };
@@ -668,6 +915,19 @@ async function probeReasoningSettings(
   }
 }
 
+function summarizeConnectionMetrics(conns: readonly RequestConnectionMetrics[]) {
+  const newSocketConns = conns.filter((c) => c.newSocket);
+  return {
+    n: conns.length,
+    newSockets: newSocketConns.length,
+    newSocketRate: formatPct(newSocketConns.length, conns.length),
+    dnsMs: summarize(newSocketConns.map((c) => c.dnsMs)),
+    tcpMs: summarize(newSocketConns.map((c) => c.tcpMs)),
+    tlsMs: summarize(newSocketConns.map((c) => c.tlsMs)),
+    totalConnectMs: summarize(newSocketConns.map((c) => c.totalConnectMs)),
+  };
+}
+
 function summarizePlainRuns(runs: readonly PlainRunSample[]) {
   const ttfts = runs.map((r) => r.ttftMs).filter((v): v is number => v !== null);
   const absFirst = runs.map((r) => r.firstSentenceAbsMs).filter((v): v is number => v !== null);
@@ -676,7 +936,9 @@ function summarizePlainRuns(runs: readonly PlainRunSample[]) {
   const reasoning = runs.map((r) => r.reasoningTokens);
   const wrongToolCalls = runs.filter((r) => r.wronglyCalledTool).length;
   const protocols = [...new Set(runs.map((r) => r.protocol))];
-  const edgeLocations = [...new Set(runs.map((r) => r.cfRayLocation).filter((v): v is string => v !== null))];
+  const edgeLocations = [
+    ...new Set(runs.map((r) => r.cfRayLocation).filter((v): v is string => v !== null)),
+  ];
   const rateLimits = Object.assign({}, ...runs.map((r) => r.rateLimitHeaders));
 
   return {
@@ -688,33 +950,62 @@ function summarizePlainRuns(runs: readonly PlainRunSample[]) {
     reasoningTokens: summarize(reasoning),
     wrongToolCalls,
     wrongToolCallRate: formatPct(wrongToolCalls, runs.length),
+    connection: summarizeConnectionMetrics(runs.map((r) => r.connection)),
     protocols,
     edgeLocations,
     rateLimitHeaders: rateLimits,
   };
 }
 
-function summarizeToolRuns(runs: readonly ToolRunSample[]) {
+function summarizeToolRuns(
+  utterance: string,
+  prompt: string,
+  expectedTool: string,
+  runs: readonly ToolRunSample[],
+) {
   const passedCount = runs.filter((r) => r.passed).length;
   const fillerRuns = runs.filter((r) => r.emittedContentBeforeToolCall);
   const fillerTtfts = fillerRuns
     .map((r) => r.preToolContentTtftMs)
     .filter((v): v is number => v !== null);
+  const followupSuccessCount = runs.filter((r) => r.followupSucceeded).length;
+  const tToolCalls = runs.map((r) => r.tToolCallMs).filter((v): v is number => v !== null);
+  const tExecs = runs.map((r) => r.tExecMs).filter((v): v is number => v !== null);
+  const followupTtfts = runs.map((r) => r.followupTtftMs).filter((v): v is number => v !== null);
+  const e2es = runs.map((r) => r.e2eMs).filter((v): v is number => v !== null);
   const totals = runs.map((r) => r.totalMs);
-  const reasoning = runs.map((r) => r.reasoningTokens);
+  const reasoningReq1 = runs.map((r) => r.reasoningTokensReq1);
+  const reasoningReq2 = runs.map((r) => r.reasoningTokensReq2);
   const protocols = [...new Set(runs.map((r) => r.protocol))];
-  const edgeLocations = [...new Set(runs.map((r) => r.cfRayLocation).filter((v): v is string => v !== null))];
+  const edgeLocations = [
+    ...new Set(runs.map((r) => r.cfRayLocation).filter((v): v is string => v !== null)),
+  ];
   const rateLimits = Object.assign({}, ...runs.map((r) => r.rateLimitHeaders));
+  const req2Conns = runs
+    .map((r) => r.connectionReq2)
+    .filter((c): c is RequestConnectionMetrics => c !== null);
 
   return {
+    utterance,
+    prompt,
+    expectedTool,
     n: runs.length,
     passedCount,
     toolCorrectnessRate: formatPct(passedCount, runs.length),
+    followupSucceededCount: followupSuccessCount,
+    followupSuccessRate: formatPct(followupSuccessCount, runs.length),
     fillerCount: fillerRuns.length,
     fillerRate: formatPct(fillerRuns.length, runs.length),
     preToolContentTtftMs: summarize(fillerTtfts),
+    tToolCallMs: summarize(tToolCalls),
+    tExecMs: summarize(tExecs),
+    followupTtftMs: summarize(followupTtfts),
+    e2eMs: summarize(e2es),
     totalMs: summarize(totals),
-    reasoningTokens: summarize(reasoning),
+    reasoningTokensReq1: summarize(reasoningReq1),
+    reasoningTokensReq2: summarize(reasoningReq2),
+    connectionReq1: summarizeConnectionMetrics(runs.map((r) => r.connectionReq1)),
+    connectionReq2: summarizeConnectionMetrics(req2Conns),
     protocols,
     edgeLocations,
     rateLimitHeaders: rateLimits,
@@ -722,12 +1013,18 @@ function summarizeToolRuns(runs: readonly ToolRunSample[]) {
   };
 }
 
-function summarizeCancelRuns(runs: readonly CancelCycleSample[], normalWarmTtftMedian: number | null) {
+function summarizeCancelRuns(
+  runs: readonly CancelCycleSample[],
+  warmBaselineLabel: string,
+  normalWarmTtftMedian: number | null,
+) {
   const postTtfts = runs.map((r) => r.postAbortTtftMs).filter((v): v is number => v !== null);
   const reconnects = runs.filter((r) => r.newSocketConnects > 0 || r.newAgentConnections > 0).length;
   const maxDeltasAfterAbort = Math.max(0, ...runs.map((r) => r.deltasAfterAbort));
   const protocols = [...new Set(runs.map((r) => r.protocol))];
-  const edgeLocations = [...new Set(runs.map((r) => r.cfRayLocation).filter((v): v is string => v !== null))];
+  const edgeLocations = [
+    ...new Set(runs.map((r) => r.cfRayLocation).filter((v): v is string => v !== null)),
+  ];
   const postStats = summarize(postTtfts);
   const deltaVsWarmMedianMs =
     postStats.median !== null && normalWarmTtftMedian !== null
@@ -736,14 +1033,130 @@ function summarizeCancelRuns(runs: readonly CancelCycleSample[], normalWarmTtftM
 
   return {
     n: runs.length,
+    warmBaselineLabel,
     maxDeltasAfterAbort,
     reconnects,
     reconnectRate: formatPct(reconnects, runs.length),
     postAbortTtftMs: postStats,
     normalWarmTtftMedianMs: normalWarmTtftMedian,
     deltaVsWarmMedianMs,
+    followUpConnection: summarizeConnectionMetrics(runs.map((r) => r.followUpConnection)),
     protocols,
     edgeLocations,
+  };
+}
+
+async function runToolTurn(
+  apiKey: string,
+  probe: ModelProbeResult,
+  warmInstr: InstrumentedAgent,
+  prompt: string,
+  validate: (toolCalls: readonly AssembledToolCall[]) => ToolValidationResult,
+  label: string,
+): Promise<ToolRunSample> {
+  const reasoningEffort =
+    probe.reasoningEffort === "not_applicable" ? undefined : probe.reasoningEffort;
+
+  const req1 = await runStreamingChat({
+    baseUrl: GROQ_BASE_URL,
+    apiKey,
+    model: probe.model,
+    prompt,
+    tools: VOICE_TOOLS,
+    reasoningEffort,
+    reasoningFormat: probe.reasoningFormat,
+    instr: warmInstr,
+  });
+  assertWarmConnection(`${label}:req1`, req1.connection);
+
+  const validation = validate(req1.parsed.toolCalls);
+  let tExecMs: number | null = null;
+  let followupTtftMs: number | null = null;
+  let followupFirstSentenceAbsMs: number | null = null;
+  let followupSucceeded = false;
+  let e2eMs: number | null = null;
+  let req2Connection: RequestConnectionMetrics | null = null;
+  let reasoningTokensReq2 = 0;
+  let totalMs = req1.totalMs;
+  let cfRayLocation = req1.cfRayLocation;
+  let rateLimitHeaders = req1.rateLimitHeaders;
+
+  if (validation.passed && req1.parsed.toolCalls.length > 0) {
+    const toolMessages: ChatMessage[] = [];
+    let execAccum = 0;
+    for (const tc of req1.parsed.toolCalls) {
+      const exec = executeLocalTool(tc);
+      execAccum += exec.execMs;
+      toolMessages.push({
+        role: "tool",
+        tool_call_id: tc.id,
+        content: exec.output,
+      });
+    }
+    tExecMs = execAccum;
+
+    const followupMessages: ChatMessage[] = [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content: prompt },
+      {
+        role: "assistant",
+        content: req1.parsed.content.length > 0 ? req1.parsed.content : null,
+        tool_calls: req1.parsed.toolCalls.map((tc) => ({
+          id: tc.id,
+          type: tc.type || "function",
+          function: {
+            name: tc.name,
+            arguments: tc.rawArguments,
+          },
+        })),
+      },
+      ...toolMessages,
+    ];
+
+    const req2 = await runStreamingChat({
+      baseUrl: GROQ_BASE_URL,
+      apiKey,
+      model: probe.model,
+      messages: followupMessages,
+      tools: VOICE_TOOLS,
+      reasoningEffort,
+      reasoningFormat: probe.reasoningFormat,
+      instr: warmInstr,
+    });
+    assertWarmConnection(`${label}:req2`, req2.connection);
+
+    req2Connection = req2.connection;
+    followupTtftMs = req2.ttftMs;
+    followupFirstSentenceAbsMs = req2.firstSentenceAbsMs;
+    followupSucceeded = req2.ttftMs !== null && req2.parsed.toolCalls.length === 0;
+    e2eMs =
+      req2.firstContentTimestampMs !== null
+        ? req2.firstContentTimestampMs - req1.startTimestampMs
+        : null;
+    reasoningTokensReq2 = req2.parsed.usage.reasoningTokens ?? 0;
+    totalMs = req1.totalMs + execAccum + req2.totalMs;
+    if (req2.cfRayLocation) cfRayLocation = req2.cfRayLocation;
+    rateLimitHeaders = { ...rateLimitHeaders, ...req2.rateLimitHeaders };
+  }
+
+  return {
+    ...validation,
+    emittedContentBeforeToolCall: req1.parsed.emittedContentBeforeToolCall,
+    preToolContentTtftMs: req1.parsed.emittedContentBeforeToolCall ? req1.ttftMs : null,
+    tToolCallMs: req1.toolCallAssembledMs,
+    tExecMs,
+    followupTtftMs,
+    followupFirstSentenceAbsMs,
+    followupSucceeded,
+    e2eMs,
+    totalMs,
+    reasoningTokensReq1: req1.parsed.usage.reasoningTokens ?? 0,
+    reasoningTokensReq2,
+    connectionReq1: req1.connection,
+    connectionReq2: req2Connection,
+    protocol: req1.connection.protocol,
+    cfRayLocation,
+    rateLimitHeaders,
   };
 }
 
@@ -752,6 +1165,7 @@ async function runCancellationSuite(
   apiKey: string,
   probe: ModelProbeResult,
   allowH2: boolean,
+  warmBaselineLabel: string,
   normalWarmTtftMedian: number | null,
 ) {
   const instr = createInstrumentedAgent(allowH2);
@@ -772,9 +1186,10 @@ async function runCancellationSuite(
         tools: VOICE_TOOLS,
         reasoningEffort,
         reasoningFormat: probe.reasoningFormat,
-        dispatcher: instr.agent,
+        instr,
         abortOnFirstContent: true,
       });
+      assertWarmConnection(`${probe.model}:D-${allowH2 ? "h2" : "h1"}[${i}]:aborted`, abortedRun.connection);
       if (!abortedRun.aborted) {
         throw new Error(
           `Cycle ${i + 1}: stream finished without emitting content before abort`,
@@ -796,7 +1211,7 @@ async function runCancellationSuite(
         tools: VOICE_TOOLS,
         reasoningEffort,
         reasoningFormat: probe.reasoningFormat,
-        dispatcher: instr.agent,
+        instr,
       });
 
       cycles.push({
@@ -805,12 +1220,14 @@ async function runCancellationSuite(
         postAbortTtftMs: followUp.ttftMs,
         newAgentConnections: instr.getConnectCount() - agentConnBefore,
         newSocketConnects: instr.getSocketCount() - sockConnBefore,
-        protocol: instr.getLastProtocol(),
+        abortedConnection: abortedRun.connection,
+        followUpConnection: followUp.connection,
+        protocol: followUp.connection.protocol,
         cfRayLocation: followUp.cfRayLocation,
       });
     }
 
-    return summarizeCancelRuns(cycles, normalWarmTtftMedian);
+    return summarizeCancelRuns(cycles, warmBaselineLabel, normalWarmTtftMedian);
   } finally {
     await instr.close();
   }
@@ -819,21 +1236,25 @@ async function runCancellationSuite(
 async function benchmarkGroqModel(
   apiKey: string,
   probe: ModelProbeResult,
+  originRttMedianMs: number | null,
 ) {
   const reasoningEffort =
     probe.reasoningEffort === "not_applicable" ? undefined : probe.reasoningEffort;
 
-  // Interleave cold (new Agent per request) and warm (shared pre-warmed Agent) runs.
-  const warmInstr = createInstrumentedAgent(false);
+  const warmH1Instr = createInstrumentedAgent(false);
+  const warmH2Instr = createInstrumentedAgent(true);
   const coldRuns: PlainRunSample[] = [];
-  const warmRuns: PlainRunSample[] = [];
-  const toolRuns: ToolRunSample[] = [];
+  const warmH1Runs: PlainRunSample[] = [];
+  const warmH2Runs: PlainRunSample[] = [];
+  const toolTimeRuns: ToolRunSample[] = [];
+  const toolOrderRuns: ToolRunSample[] = [];
 
   try {
-    await listModels(GROQ_BASE_URL, apiKey, warmInstr.agent);
+    await listModels(GROQ_BASE_URL, apiKey, warmH1Instr.agent);
+    await listModels(GROQ_BASE_URL, apiKey, warmH2Instr.agent);
 
     for (let i = 0; i < N_PLAIN; i += 1) {
-      const coldInstr = createInstrumentedAgent(false);
+      const coldInstr = createInstrumentedAgent(false, { disableSessionCache: true });
       try {
         const coldRes = await runStreamingChat({
           baseUrl: GROQ_BASE_URL,
@@ -843,8 +1264,9 @@ async function benchmarkGroqModel(
           tools: VOICE_TOOLS,
           reasoningEffort,
           reasoningFormat: probe.reasoningFormat,
-          dispatcher: coldInstr.agent,
+          instr: coldInstr,
         });
+        assertColdConnection(`${probe.model}:A[${i}]`, coldRes.connection);
         coldRuns.push({
           ttftMs: coldRes.ttftMs,
           firstSentenceAbsMs: coldRes.firstSentenceAbsMs,
@@ -852,7 +1274,8 @@ async function benchmarkGroqModel(
           totalMs: coldRes.totalMs,
           reasoningTokens: coldRes.parsed.usage.reasoningTokens ?? 0,
           wronglyCalledTool: coldRes.parsed.toolCalls.length > 0,
-          protocol: coldInstr.getLastProtocol(),
+          connection: coldRes.connection,
+          protocol: coldRes.connection.protocol,
           cfRayLocation: coldRes.cfRayLocation,
           rateLimitHeaders: coldRes.rateLimitHeaders,
         });
@@ -861,7 +1284,7 @@ async function benchmarkGroqModel(
       }
       await sleep(GROQ_PACING_MS);
 
-      const warmRes = await runStreamingChat({
+      const warmH1Res = await runStreamingChat({
         baseUrl: GROQ_BASE_URL,
         apiKey,
         model: probe.model,
@@ -869,58 +1292,100 @@ async function benchmarkGroqModel(
         tools: VOICE_TOOLS,
         reasoningEffort,
         reasoningFormat: probe.reasoningFormat,
-        dispatcher: warmInstr.agent,
+        instr: warmH1Instr,
       });
-      warmRuns.push({
-        ttftMs: warmRes.ttftMs,
-        firstSentenceAbsMs: warmRes.firstSentenceAbsMs,
-        firstSentenceRelMs: warmRes.firstSentenceRelMs,
-        totalMs: warmRes.totalMs,
-        reasoningTokens: warmRes.parsed.usage.reasoningTokens ?? 0,
-        wronglyCalledTool: warmRes.parsed.toolCalls.length > 0,
-        protocol: warmInstr.getLastProtocol(),
-        cfRayLocation: warmRes.cfRayLocation,
-        rateLimitHeaders: warmRes.rateLimitHeaders,
+      assertWarmConnection(`${probe.model}:B-h1[${i}]`, warmH1Res.connection);
+      warmH1Runs.push({
+        ttftMs: warmH1Res.ttftMs,
+        firstSentenceAbsMs: warmH1Res.firstSentenceAbsMs,
+        firstSentenceRelMs: warmH1Res.firstSentenceRelMs,
+        totalMs: warmH1Res.totalMs,
+        reasoningTokens: warmH1Res.parsed.usage.reasoningTokens ?? 0,
+        wronglyCalledTool: warmH1Res.parsed.toolCalls.length > 0,
+        connection: warmH1Res.connection,
+        protocol: warmH1Res.connection.protocol,
+        cfRayLocation: warmH1Res.cfRayLocation,
+        rateLimitHeaders: warmH1Res.rateLimitHeaders,
+      });
+      await sleep(GROQ_PACING_MS);
+
+      const warmH2Res = await runStreamingChat({
+        baseUrl: GROQ_BASE_URL,
+        apiKey,
+        model: probe.model,
+        prompt: PLAIN_PROMPT,
+        tools: VOICE_TOOLS,
+        reasoningEffort,
+        reasoningFormat: probe.reasoningFormat,
+        instr: warmH2Instr,
+      });
+      assertWarmConnection(`${probe.model}:B-h2[${i}]`, warmH2Res.connection);
+      warmH2Runs.push({
+        ttftMs: warmH2Res.ttftMs,
+        firstSentenceAbsMs: warmH2Res.firstSentenceAbsMs,
+        firstSentenceRelMs: warmH2Res.firstSentenceRelMs,
+        totalMs: warmH2Res.totalMs,
+        reasoningTokens: warmH2Res.parsed.usage.reasoningTokens ?? 0,
+        wronglyCalledTool: warmH2Res.parsed.toolCalls.length > 0,
+        connection: warmH2Res.connection,
+        protocol: warmH2Res.connection.protocol,
+        cfRayLocation: warmH2Res.cfRayLocation,
+        rateLimitHeaders: warmH2Res.rateLimitHeaders,
       });
       await sleep(GROQ_PACING_MS);
     }
 
     for (let i = 0; i < N_TOOL; i += 1) {
-      const toolRes = await runStreamingChat({
-        baseUrl: GROQ_BASE_URL,
-        apiKey,
-        model: probe.model,
-        prompt: TOOL_PROMPT,
-        tools: VOICE_TOOLS,
-        reasoningEffort,
-        reasoningFormat: probe.reasoningFormat,
-        dispatcher: warmInstr.agent,
-      });
-      const validation = validateOrderStatusToolCalls(toolRes.parsed.toolCalls);
-      toolRuns.push({
-        ...validation,
-        emittedContentBeforeToolCall: toolRes.parsed.emittedContentBeforeToolCall,
-        preToolContentTtftMs: toolRes.parsed.emittedContentBeforeToolCall ? toolRes.ttftMs : null,
-        totalMs: toolRes.totalMs,
-        reasoningTokens: toolRes.parsed.usage.reasoningTokens ?? 0,
-        protocol: warmInstr.getLastProtocol(),
-        cfRayLocation: toolRes.cfRayLocation,
-        rateLimitHeaders: toolRes.rateLimitHeaders,
-      });
-      await sleep(GROQ_PACING_MS);
+      toolTimeRuns.push(
+        await runToolTurn(
+          apiKey,
+          probe,
+          warmH1Instr,
+          TIME_TOOL_PROMPT,
+          validateCurrentTimeToolCalls,
+          `${probe.model}:C-time[${i}]`,
+        ),
+      );
+      await sleep(GROQ_PACING_MS * 2);
+
+      toolOrderRuns.push(
+        await runToolTurn(
+          apiKey,
+          probe,
+          warmH1Instr,
+          ORDER_TOOL_PROMPT,
+          validateOrderStatusToolCalls,
+          `${probe.model}:C-order[${i}]`,
+        ),
+      );
+      await sleep(GROQ_PACING_MS * 2);
     }
   } finally {
-    await warmInstr.close();
+    await warmH1Instr.close();
+    await warmH2Instr.close();
   }
 
   const coldSummary = summarizePlainRuns(coldRuns);
-  const warmSummary = summarizePlainRuns(warmRuns);
-  const toolSummary = summarizeToolRuns(toolRuns);
+  const warmSummary = summarizePlainRuns(warmH1Runs);
+  const warmH2Summary = summarizePlainRuns(warmH2Runs);
+  const toolTimeSummary = summarizeToolRuns(
+    "time",
+    TIME_TOOL_PROMPT,
+    "get_current_time",
+    toolTimeRuns,
+  );
+  const toolOrderSummary = summarizeToolRuns(
+    "order",
+    ORDER_TOOL_PROMPT,
+    "get_order_status",
+    toolOrderRuns,
+  );
   const cancelH1 = await runCancellationSuite(
     GROQ_BASE_URL,
     apiKey,
     probe,
     false,
+    "B: Warm H1",
     warmSummary.ttftMs.median,
   );
   const cancelH2 = await runCancellationSuite(
@@ -928,14 +1393,30 @@ async function benchmarkGroqModel(
     apiKey,
     probe,
     true,
-    warmSummary.ttftMs.median,
+    "B-h2: Warm H2",
+    warmH2Summary.ttftMs.median,
   );
+
+  const estimatedModelTimeMs = {
+    h1Ms:
+      warmSummary.ttftMs.median !== null && originRttMedianMs !== null
+        ? warmSummary.ttftMs.median - originRttMedianMs
+        : null,
+    h2Ms:
+      warmH2Summary.ttftMs.median !== null && originRttMedianMs !== null
+        ? warmH2Summary.ttftMs.median - originRttMedianMs
+        : null,
+    originRttMedianMs,
+  };
 
   return {
     settings: probe,
+    estimatedModelTimeMs,
     scenarioA_cold: coldSummary,
     scenarioB_warm: warmSummary,
-    scenarioC_tool: toolSummary,
+    scenarioB_warmH2: warmH2Summary,
+    scenarioC_tool_time: toolTimeSummary,
+    scenarioC_tool_order: toolOrderSummary,
     scenarioD_cancelH1: cancelH1,
     scenarioD_cancelH2: cancelH2,
   };
@@ -944,6 +1425,7 @@ async function benchmarkGroqModel(
 async function benchmarkGeminiScenarioB(
   apiKey: string,
   probe: ModelProbeResult,
+  originRttMedianMs: number | null,
 ) {
   const instr = createInstrumentedAgent(false);
   const runs: PlainRunSample[] = [];
@@ -960,8 +1442,9 @@ async function benchmarkGeminiScenarioB(
         prompt: PLAIN_PROMPT,
         tools: VOICE_TOOLS,
         reasoningEffort,
-        dispatcher: instr.agent,
+        instr,
       });
+      assertWarmConnection(`${probe.model}:B-h1[${i}]`, res.connection);
       runs.push({
         ttftMs: res.ttftMs,
         firstSentenceAbsMs: res.firstSentenceAbsMs,
@@ -969,7 +1452,8 @@ async function benchmarkGeminiScenarioB(
         totalMs: res.totalMs,
         reasoningTokens: res.parsed.usage.reasoningTokens ?? 0,
         wronglyCalledTool: res.parsed.toolCalls.length > 0,
-        protocol: instr.getLastProtocol(),
+        connection: res.connection,
+        protocol: res.connection.protocol,
         cfRayLocation: res.cfRayLocation,
         rateLimitHeaders: res.rateLimitHeaders,
       });
@@ -981,10 +1465,30 @@ async function benchmarkGeminiScenarioB(
     await instr.close();
   }
 
+  const warmSummary = summarizePlainRuns(runs);
   return {
     settings: probe,
-    scenarioB_warm: summarizePlainRuns(runs),
+    estimatedModelTimeMs: {
+      h1Ms:
+        warmSummary.ttftMs.median !== null && originRttMedianMs !== null
+          ? warmSummary.ttftMs.median - originRttMedianMs
+          : null,
+      originRttMedianMs,
+    },
+    scenarioB_warm: warmSummary,
   };
+}
+
+function formatConnectionLine(c: ReturnType<typeof summarizeConnectionMetrics>): string {
+  if (c.newSockets === 0) {
+    return `NewSocket: ${c.newSocketRate}`;
+  }
+  return (
+    `NewSocket: ${c.newSocketRate} | ` +
+    `DNS med=${formatMs(c.dnsMs.median)} p90=${formatMs(c.dnsMs.p90)} | ` +
+    `TCP med=${formatMs(c.tcpMs.median)} p90=${formatMs(c.tcpMs.p90)} | ` +
+    `TLS med=${formatMs(c.tlsMs.median)} p90=${formatMs(c.tlsMs.p90)}`
+  );
 }
 
 function printPlainSummary(label: string, s: ReturnType<typeof summarizePlainRuns>): void {
@@ -1001,8 +1505,33 @@ function printPlainSummary(label: string, s: ReturnType<typeof summarizePlainRun
       `ReasoningTok: med=${s.reasoningTokens.median ?? 0} p90=${s.reasoningTokens.p90 ?? 0} | ` +
       `WrongToolCalls: ${s.wrongToolCallRate}`,
   );
+  console.log(`    Conn: ${formatConnectionLine(s.connection)}`);
   if (Object.keys(s.rateLimitHeaders).length > 0) {
     console.log(`    x-ratelimit: ${JSON.stringify(s.rateLimitHeaders)}`);
+  }
+}
+
+function printToolSummary(label: string, c: ReturnType<typeof summarizeToolRuns>): void {
+  console.log(
+    `  ${label} (n=${c.n}, proto=${c.protocols.join(",") || "unknown"}, edge=${c.edgeLocations.join(",") || "none"}):`,
+  );
+  console.log(
+    `    Correct(${c.expectedTool}): ${c.toolCorrectnessRate} | ` +
+      `FollowupOK: ${c.followupSuccessRate} | ` +
+      `PreToolFiller: ${c.fillerRate}`,
+  );
+  console.log(
+    `    t_toolcall: med=${formatMs(c.tToolCallMs.median)} p90=${formatMs(c.tToolCallMs.p90)} | ` +
+      `t_exec: med=${formatMs(c.tExecMs.median)} p90=${formatMs(c.tExecMs.p90)} | ` +
+      `followup_ttft: med=${formatMs(c.followupTtftMs.median)} p90=${formatMs(c.followupTtftMs.p90)} | ` +
+      `e2e: med=${formatMs(c.e2eMs.median)} p90=${formatMs(c.e2eMs.p90)}`,
+  );
+  console.log(
+    `    ReasoningTok(req1/req2): med=${c.reasoningTokensReq1.median ?? 0}/${c.reasoningTokensReq2.median ?? 0} | ` +
+      `ConnReq1(${c.connectionReq1.newSocketRate}) ConnReq2(${c.connectionReq2.newSocketRate})`,
+  );
+  if (c.failureReasons.length > 0) {
+    console.log(`    ToolFailures: ${c.failureReasons.join(", ")}`);
   }
 }
 
@@ -1010,27 +1539,16 @@ function printModelReport(role: string, report: Awaited<ReturnType<typeof benchm
   console.log(
     `\n=== Groq [${role}] model=${report.settings.model} reasoning=${report.settings.reasoningEffort} format=${report.settings.reasoningFormat} ===`,
   );
+  console.log(
+    `  Derived: model time ≈ warm TTFT - origin RTT -> ` +
+      `h1=${formatMs(report.estimatedModelTimeMs.h1Ms)} (${formatMs(report.scenarioB_warm.ttftMs.median)} - ${formatMs(report.estimatedModelTimeMs.originRttMedianMs)}), ` +
+      `h2=${formatMs(report.estimatedModelTimeMs.h2Ms)} (${formatMs(report.scenarioB_warmH2.ttftMs.median)} - ${formatMs(report.estimatedModelTimeMs.originRttMedianMs)})`,
+  );
   printPlainSummary("Scenario A (Cold)", report.scenarioA_cold);
-  printPlainSummary("Scenario B (Warm)", report.scenarioB_warm);
-
-  const c = report.scenarioC_tool;
-  console.log(
-    `  Scenario C (Tool n=${c.n}, proto=${c.protocols.join(",") || "unknown"}, edge=${c.edgeLocations.join(",") || "none"}):`,
-  );
-  console.log(
-    `    ToolCorrectness(order_id=1042): ${c.toolCorrectnessRate} | ` +
-      `PreToolFiller: ${c.fillerRate} (TTFT med=${formatMs(c.preToolContentTtftMs.median)} p90=${formatMs(c.preToolContentTtftMs.p90)})`,
-  );
-  console.log(
-    `    Total: med=${formatMs(c.totalMs.median)} p90=${formatMs(c.totalMs.p90)} | ` +
-      `ReasoningTok: med=${c.reasoningTokens.median ?? 0} p90=${c.reasoningTokens.p90 ?? 0}`,
-  );
-  if (c.failureReasons.length > 0) {
-    console.log(`    ToolFailures: ${c.failureReasons.join(", ")}`);
-  }
-  if (Object.keys(c.rateLimitHeaders).length > 0) {
-    console.log(`    x-ratelimit: ${JSON.stringify(c.rateLimitHeaders)}`);
-  }
+  printPlainSummary("Scenario B (Warm H1)", report.scenarioB_warm);
+  printPlainSummary("Scenario B-h2 (Warm H2)", report.scenarioB_warmH2);
+  printToolSummary("Scenario C (Tool: time)", report.scenarioC_tool_time);
+  printToolSummary("Scenario C (Tool: order)", report.scenarioC_tool_order);
 
   for (const [tag, d] of [
     ["Scenario D (Cancel H1)", report.scenarioD_cancelH1],
@@ -1041,13 +1559,18 @@ function printModelReport(role: string, report: Awaited<ReturnType<typeof benchm
     );
     console.log(
       `    PostAbortTTFT: med=${formatMs(d.postAbortTtftMs.median)} p90=${formatMs(d.postAbortTtftMs.p90)} ` +
-        `(vs Warm med ${formatMs(d.normalWarmTtftMedianMs)}, delta=${d.deltaVsWarmMedianMs !== null ? `${d.deltaVsWarmMedianMs.toFixed(1)} ms` : "n/a"}) | ` +
+        `(vs ${d.warmBaselineLabel} med ${formatMs(d.normalWarmTtftMedianMs)}, delta=${d.deltaVsWarmMedianMs !== null ? `${d.deltaVsWarmMedianMs.toFixed(1)} ms` : "n/a"}) | ` +
         `Reconnects: ${d.reconnectRate} | DeltasAfterAbortMax: ${d.maxDeltasAfterAbort}`,
     );
+    console.log(`    FollowUpConn: ${formatConnectionLine(d.followUpConnection)}`);
   }
 }
 
-function assertModelsPresent(provider: string, requested: readonly string[], available: readonly string[]): void {
+function assertModelsPresent(
+  provider: string,
+  requested: readonly string[],
+  available: readonly string[],
+): void {
   for (const id of requested) {
     if (!available.includes(id)) {
       throw new Error(
@@ -1117,8 +1640,13 @@ async function main(): Promise<void> {
     true,
   );
 
-  const fastReport = await benchmarkGroqModel(cfg.groqApiKey, fastProbe);
-  const reliableReport = await benchmarkGroqModel(cfg.groqApiKey, reliableProbe);
+  const groqOriginRttMedian = groqBase.baseline.originRttMs.median;
+  const fastReport = await benchmarkGroqModel(cfg.groqApiKey, fastProbe, groqOriginRttMedian);
+  const reliableReport = await benchmarkGroqModel(
+    cfg.groqApiKey,
+    reliableProbe,
+    groqOriginRttMedian,
+  );
 
   printModelReport("FAST", fastReport);
   printModelReport("RELIABLE", reliableReport);
@@ -1141,9 +1669,16 @@ async function main(): Promise<void> {
       cfg.geminiReasoningEffort,
       false,
     );
-    geminiReport = await benchmarkGeminiScenarioB(cfg.geminiApiKey, gemProbe);
+    geminiReport = await benchmarkGeminiScenarioB(
+      cfg.geminiApiKey,
+      gemProbe,
+      gemBase.baseline.originRttMs.median,
+    );
     console.log(
       `\n=== Gemini [FAILOVER] model=${geminiReport.settings.model} thinking=${geminiReport.settings.reasoningEffort} ===`,
+    );
+    console.log(
+      `  Derived: model time ≈ warm TTFT - origin RTT -> ${formatMs(geminiReport.estimatedModelTimeMs.h1Ms)} (${formatMs(geminiReport.scenarioB_warm.ttftMs.median)} - ${formatMs(geminiReport.estimatedModelTimeMs.originRttMedianMs)})`,
     );
     printPlainSummary("Scenario B (Warm)", geminiReport.scenarioB_warm);
   }

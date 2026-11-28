@@ -1,4 +1,8 @@
-import { EXPECTED_ORDER_ID, OrderStatusArgsSchema } from "./config.js";
+import {
+  CurrentTimeArgsSchema,
+  EXPECTED_ORDER_ID,
+  OrderStatusArgsSchema,
+} from "./config.js";
 
 export interface RawToolCallDelta {
   readonly index?: number;
@@ -86,6 +90,7 @@ export interface ToolValidationResult {
   readonly calledAnyTool: boolean;
   readonly calledExpectedTool: boolean;
   readonly validJsonArgs: boolean;
+  readonly validArgsSchema: boolean;
   readonly correctOrderId: boolean;
   readonly passed: boolean;
   readonly reason: string | null;
@@ -262,26 +267,31 @@ export class GroqStreamAccumulator {
   }
 }
 
-export function validateOrderStatusToolCalls(
+function validateToolCallWithSchema<T>(
   toolCalls: readonly AssembledToolCall[],
+  expectedToolName: string,
+  schema: { safeParse: (input: unknown) => { success: true; data: T } | { success: false } },
+  checkArgs?: (data: T) => { readonly ok: boolean; readonly correctOrderId: boolean; readonly failReason: string },
 ): ToolValidationResult {
   if (toolCalls.length === 0) {
     return {
       calledAnyTool: false,
       calledExpectedTool: false,
       validJsonArgs: false,
+      validArgsSchema: false,
       correctOrderId: false,
       passed: false,
       reason: "no_tool_call",
     };
   }
 
-  const target = toolCalls.find((tc) => tc.name === "get_order_status");
+  const target = toolCalls.find((tc) => tc.name === expectedToolName);
   if (target === undefined) {
     return {
       calledAnyTool: true,
       calledExpectedTool: false,
       validJsonArgs: false,
+      validArgsSchema: false,
       correctOrderId: false,
       passed: false,
       reason: `wrong_tool:${toolCalls[0]?.name ?? "unknown"}`,
@@ -293,31 +303,65 @@ export function validateOrderStatusToolCalls(
       calledAnyTool: true,
       calledExpectedTool: true,
       validJsonArgs: false,
+      validArgsSchema: false,
       correctOrderId: false,
       passed: false,
       reason: "invalid_json",
     };
   }
 
-  const parsed = OrderStatusArgsSchema.safeParse(target.parsedArguments);
+  const parsed = schema.safeParse(target.parsedArguments);
   if (!parsed.success) {
     return {
       calledAnyTool: true,
       calledExpectedTool: true,
-      validJsonArgs: false,
+      validJsonArgs: true,
+      validArgsSchema: false,
       correctOrderId: false,
       passed: false,
       reason: "schema_mismatch",
     };
   }
 
-  const correctOrderId = parsed.data.order_id === EXPECTED_ORDER_ID;
+  if (checkArgs === undefined) {
+    return {
+      calledAnyTool: true,
+      calledExpectedTool: true,
+      validJsonArgs: true,
+      validArgsSchema: true,
+      correctOrderId: false,
+      passed: true,
+      reason: null,
+    };
+  }
+
+  const checked = checkArgs(parsed.data);
   return {
     calledAnyTool: true,
     calledExpectedTool: true,
     validJsonArgs: true,
-    correctOrderId,
-    passed: correctOrderId,
-    reason: correctOrderId ? null : `wrong_order_id:${parsed.data.order_id}`,
+    validArgsSchema: true,
+    correctOrderId: checked.correctOrderId,
+    passed: checked.ok,
+    reason: checked.ok ? null : checked.failReason,
   };
+}
+
+export function validateOrderStatusToolCalls(
+  toolCalls: readonly AssembledToolCall[],
+): ToolValidationResult {
+  return validateToolCallWithSchema(toolCalls, "get_order_status", OrderStatusArgsSchema, (data) => {
+    const correctOrderId = data.order_id === EXPECTED_ORDER_ID;
+    return {
+      ok: correctOrderId,
+      correctOrderId,
+      failReason: `wrong_order_id:${data.order_id}`,
+    };
+  });
+}
+
+export function validateCurrentTimeToolCalls(
+  toolCalls: readonly AssembledToolCall[],
+): ToolValidationResult {
+  return validateToolCallWithSchema(toolCalls, "get_current_time", CurrentTimeArgsSchema);
 }

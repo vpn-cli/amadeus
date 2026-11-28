@@ -11,8 +11,12 @@ export const SYSTEM_PROMPT =
 export const PLAIN_PROMPT =
   "Explain in two short sentences why the sky looks blue during the day.";
 
-export const TOOL_PROMPT =
+export const TIME_TOOL_PROMPT = "What time is it?";
+
+export const ORDER_TOOL_PROMPT =
   "Can you check the status of my order number one zero four two?";
+
+export const TOOL_PROMPT = ORDER_TOOL_PROMPT;
 
 export const EXPECTED_ORDER_ID = "1042" as const;
 

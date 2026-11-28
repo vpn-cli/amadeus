@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { GroqStreamAccumulator, validateOrderStatusToolCalls } from "./stream-parser.js";
+import {
+  GroqStreamAccumulator,
+  validateCurrentTimeToolCalls,
+  validateOrderStatusToolCalls,
+} from "./stream-parser.js";
 
 describe("GroqStreamAccumulator", () => {
   it("ignores empty content and reasoning chunks for TTFT and tracks reasoning tokens", () => {
@@ -119,6 +123,7 @@ describe("GroqStreamAccumulator", () => {
       calledAnyTool: true,
       calledExpectedTool: true,
       validJsonArgs: true,
+      validArgsSchema: true,
       correctOrderId: true,
       passed: true,
       reason: null,
@@ -169,9 +174,76 @@ describe("GroqStreamAccumulator", () => {
     ).toMatchObject({
       calledExpectedTool: true,
       validJsonArgs: true,
+      validArgsSchema: true,
       correctOrderId: false,
       passed: false,
       reason: "wrong_order_id:1043",
     });
+  });
+
+  it("validates get_current_time tool calls with optional timezone", () => {
+    expect(
+      validateCurrentTimeToolCalls([
+        {
+          index: 0,
+          id: "t1",
+          type: "function",
+          name: "get_current_time",
+          rawArguments: "{}",
+          parsedArguments: {},
+          validJson: true,
+        },
+      ]),
+    ).toEqual({
+      calledAnyTool: true,
+      calledExpectedTool: true,
+      validJsonArgs: true,
+      validArgsSchema: true,
+      correctOrderId: false,
+      passed: true,
+      reason: null,
+    });
+
+    expect(
+      validateCurrentTimeToolCalls([
+        {
+          index: 0,
+          id: "t2",
+          type: "function",
+          name: "get_current_time",
+          rawArguments: '{"timezone":"Asia/Kolkata"}',
+          parsedArguments: { timezone: "Asia/Kolkata" },
+          validJson: true,
+        },
+      ]).passed,
+    ).toBe(true);
+
+    expect(
+      validateCurrentTimeToolCalls([
+        {
+          index: 0,
+          id: "t3",
+          type: "function",
+          name: "get_current_time",
+          rawArguments: '{"timezone":""}',
+          parsedArguments: { timezone: "" },
+          validJson: true,
+        },
+      ]).reason,
+    ).toBe("schema_mismatch");
+
+    expect(
+      validateCurrentTimeToolCalls([
+        {
+          index: 0,
+          id: "t4",
+          type: "function",
+          name: "get_order_status",
+          rawArguments: '{"order_id":"1042"}',
+          parsedArguments: { order_id: "1042" },
+          validJson: true,
+        },
+      ]).reason,
+    ).toBe("wrong_tool:get_order_status");
   });
 });
