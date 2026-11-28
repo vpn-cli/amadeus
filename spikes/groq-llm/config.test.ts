@@ -20,6 +20,7 @@ import {
   loadModelsFile,
   loadSpikeConfig,
   parseDotEnv,
+  parseTask3dModelFilter,
   type ModelsFileConfig,
 } from "./config.js";
 
@@ -199,5 +200,23 @@ describe("config", () => {
       GROQ_MODEL_FAST: "fast",
       EMPTY: "",
     });
+  });
+
+  it("parses --models filter for Task 3d runs", () => {
+    expect(parseTask3dModelFilter(["--task3d"])).toEqual([
+      "qwen_none",
+      "qwen_low",
+      "gpt_oss_120b_low",
+    ]);
+    expect(parseTask3dModelFilter(["--task3d", "--models=120b"])).toEqual(["gpt_oss_120b_low"]);
+    expect(parseTask3dModelFilter(["--task3d", "--models", "qwen"])).toEqual([
+      "qwen_none",
+      "qwen_low",
+    ]);
+    expect(parseTask3dModelFilter(["--models=openai/gpt-oss-120b,qwen_none"])).toEqual([
+      "qwen_none",
+      "gpt_oss_120b_low",
+    ]);
+    expect(() => parseTask3dModelFilter(["--models=bogus"])).toThrow(/Unknown --models target/);
   });
 });

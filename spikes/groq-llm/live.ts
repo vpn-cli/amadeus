@@ -18,6 +18,7 @@ import {
   PROMPT_VERSION_V2,
   SYSTEM_PROMPT,
   SYSTEM_PROMPT_V2,
+  TASK3D_MODEL_IDS,
   TIME_TOOL_PROMPT,
   TIME_TOOL_PROMPT_V2,
   TOOL_SCHEMA_VERSION_V1,
@@ -27,10 +28,12 @@ import {
   loadApiKeysConfig,
   loadSpikeConfig,
   parseDotEnv,
+  parseTask3dModelFilter,
   type GroqServiceTier,
   type OpenAiToolDefinition,
   type ReasoningEffort,
   type SpikeEnvConfig,
+  type Task3dModelId,
 } from "./config.js";
 import { SentenceSplitter } from "./sentence-splitter.js";
 import { SseParser } from "./sse.js";
@@ -45,6 +48,14 @@ import {
   type ParsedStreamResult,
   type ToolValidationResult,
 } from "./stream-parser.js";
+import {
+  GROQ_TPD_LIMIT,
+  appendUsageLedgerEntry,
+  evaluateGroqTokenBudgets,
+  readUsageLedger,
+  type ModelTokenBudget,
+  type PlannedModelRequests,
+} from "./usage-ledger.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "../..");
@@ -52,6 +63,7 @@ const OUT_DIR = path.join(__dirname, "out");
 const RESULTS_PATH = path.join(OUT_DIR, "results.json");
 const TASK3C_RESULTS_PATH = path.join(OUT_DIR, "task3c-results.json");
 const TASK3D_RESULTS_PATH = path.join(OUT_DIR, "task3d-results.json");
+const USAGE_LEDGER_PATH = path.join(OUT_DIR, "usage-ledger.jsonl");
 
 const GROQ_BASE_URL = "https://api.groq.com/openai/v1";
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai";
@@ -824,6 +836,24 @@ async function runStreamingChat(opts: ChatRequestOptions): Promise<ChatStreamOut
     opts.instr.getConnectEventsSince(connectEventsStartIdx),
     opts.instr.getLastProtocol(),
   );
+
+  if (
+    opts.baseUrl === GROQ_BASE_URL &&
+    (parsed.usage.totalTokens !== null ||
+      parsed.usage.promptTokens !== null ||
+      parsed.usage.completionTokens !== null)
+  ) {
+    const promptTokens = parsed.usage.promptTokens ?? 0;
+    const completionTokens = parsed.usage.completionTokens ?? 0;
+    const totalTokens = parsed.usage.totalTokens ?? promptTokens + completionTokens;
+    appendUsageLedgerEntry(USAGE_LEDGER_PATH, {
+      ts: new Date().toISOString(),
+      model: opts.model,
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: totalTokens,
+    });
+  }
 
   return {
     parsed,
@@ -1743,6 +1773,44 @@ async function benchmarkGeminiScenarioB(
   };
 }
 
+function checkGroqTokenBudget(
+  plans: readonly PlannedModelRequests[],
+  ledgerPath: string = USAGE_LEDGER_PATH,
+): readonly ModelTokenBudget[] {
+  const entries = readUsageLedger(ledgerPath);
+  const evaluation = evaluateGroqTokenBudgets(entries, plans);
+
+  console.log(
+    `\n=== Groq Token Budget Check (limit=${GROQ_TPD_LIMIT.toLocaleString("en-US")} TPD/model) ===`,
+  );
+  console.log(`  Ledger: ${ledgerPath} (${entries.length} recorded requests)`);
+  for (const b of evaluation.models) {
+    const estDetail =
+      b.estimatedTokensSource === "ledger_median"
+        ? `median=${b.medianTokensPerRequest} tok/req from ${b.ledgerSamples} ledger samples`
+        : `default=${b.medianTokensPerRequest} tok/req (no ledger data)`;
+    console.log(
+      `  ${b.model}: planned=${b.plannedRequests} reqs | est=${b.estimatedTokens} tok (${estDetail}) | ` +
+        `used_24h=${b.usedLast24h} tok | projected=${b.projectedTotalTokens}/${b.limitTpd} -> ${b.withinLimit ? "OK" : "STOP"}`,
+    );
+  }
+
+  if (!evaluation.ok) {
+    const over = evaluation.models
+      .filter((m) => !m.withinLimit)
+      .map(
+        (m) =>
+          `${m.model}: used_24h=${m.usedLast24h} + est=${m.estimatedTokens} = ${m.projectedTotalTokens} > ${m.limitTpd}`,
+      )
+      .join("; ");
+    throw new Error(
+      `Stopping before live run: estimated token usage would exceed Groq 200,000 TPD limit (${over})`,
+    );
+  }
+
+  return evaluation.models;
+}
+
 function checkGroqRequestBudget(
   modelsBaselineHeaders: Record<string, string>,
   candidates: readonly GroqCandidateSpec[],
@@ -1990,6 +2058,12 @@ async function runTask3cDiagnosis(): Promise<void> {
     throw new Error("GROQ_MODEL_NOREASON is required for --task3c");
   }
   const qwenModel = cfg.groqModelNoReason;
+
+  checkGroqTokenBudget([
+    { model: cfg.groqModelFast, plannedRequests: N_TASK3C + 2 },
+    { model: cfg.groqModelReliable, plannedRequests: N_TASK3C + 2 },
+    { model: qwenModel, plannedRequests: N_TASK3C + 3 * 2 * N_TASK3C * 2 + 4 },
+  ]);
 
   const groqBase = await measureBaseline("Groq", GROQ_BASE_URL, cfg.groqApiKey);
   const requestedGroqModels = [cfg.groqModelFast, cfg.groqModelReliable, qwenModel];
@@ -2276,7 +2350,7 @@ interface Task3dPromptSpec {
 }
 
 interface Task3dModelSpec {
-  readonly id: "qwen_none" | "qwen_low" | "gpt_oss_120b_low";
+  readonly id: Task3dModelId;
   readonly label: string;
   readonly model: string;
   readonly probe: ModelProbeResult;
@@ -2455,104 +2529,152 @@ async function probeGroqServiceTiers(
 async function runTask3dExperiment(): Promise<void> {
   loadEnvFromRoot();
   const cfg: SpikeEnvConfig = loadSpikeConfig(process.env);
-  if (!cfg.groqModelNoReason) {
-    throw new Error("GROQ_MODEL_NOREASON is required for --task3d");
+  const selectedIds = parseTask3dModelFilter(process.argv.slice(2));
+  const runQwenNone = selectedIds.includes("qwen_none");
+  const runQwenLow = selectedIds.includes("qwen_low");
+  const runQwen = runQwenNone || runQwenLow;
+  const run120b = selectedIds.includes("gpt_oss_120b_low");
+
+  if (runQwen && !cfg.groqModelNoReason) {
+    throw new Error("GROQ_MODEL_NOREASON is required when running qwen in --task3d");
   }
-  const qwenModel = cfg.groqModelNoReason;
+  const qwenModel = cfg.groqModelNoReason ?? "";
   const reliableModel = cfg.groqModelReliable;
 
-  const groqBase = await measureBaseline("Groq", GROQ_BASE_URL, cfg.groqApiKey);
-  assertModelsPresent("Groq", [qwenModel, reliableModel], groqBase.modelIds);
+  const qwenNonePlanned = runQwenNone ? 2 * N_TASK3D + 2 * N_TASK3D + 3 * N_TASK3D : 0; // 70 max
+  const qwenLowPlanned = runQwenLow ? 2 * N_TASK3D + 2 * N_TASK3D + 3 * N_TASK3D : 0; // 70 max
+  const qwenPlannedMax = qwenNonePlanned + qwenLowPlanned;
+  const reliableMatrixPlannedMax = run120b ? 2 * N_TASK3D + 2 * N_TASK3D + 3 * N_TASK3D : 0; // 70 max
 
-  const qwenNoneProbe = await probeReasoningSettings(
-    GROQ_BASE_URL,
-    cfg.groqApiKey,
-    qwenModel,
-    "none",
-    true,
-  );
-  const qwenLowProbe = await probeReasoningSettings(
-    GROQ_BASE_URL,
-    cfg.groqApiKey,
-    qwenModel,
-    "low",
-    true,
-  );
-  const reliableProbe = await probeReasoningSettings(
-    GROQ_BASE_URL,
-    cfg.groqApiKey,
-    reliableModel,
-    cfg.groqReliableReasoningEffort ?? "low",
-    true,
-  );
+  const tokenPlans: PlannedModelRequests[] = [];
+  if (runQwen) {
+    const qwenProbeEst = (runQwenNone ? 1 : 0) + (runQwenLow ? 1 : 0);
+    tokenPlans.push({ model: qwenModel, plannedRequests: qwenPlannedMax + qwenProbeEst });
+  }
+  if (run120b) {
+    tokenPlans.push({
+      model: reliableModel,
+      plannedRequests: reliableMatrixPlannedMax + 1 + GROQ_SERVICE_TIERS.length,
+    });
+  }
+  const tokenBudget = checkGroqTokenBudget(tokenPlans);
+
+  const groqBase = await measureBaseline("Groq", GROQ_BASE_URL, cfg.groqApiKey);
+  const requiredModels = [
+    ...(runQwen ? [qwenModel] : []),
+    ...(run120b ? [reliableModel] : []),
+  ];
+  assertModelsPresent("Groq", requiredModels, groqBase.modelIds);
+
+  const qwenNoneProbe = runQwenNone
+    ? await probeReasoningSettings(GROQ_BASE_URL, cfg.groqApiKey, qwenModel, "none", true)
+    : null;
+  const qwenLowProbe = runQwenLow
+    ? await probeReasoningSettings(GROQ_BASE_URL, cfg.groqApiKey, qwenModel, "low", true)
+    : null;
+  const reliableProbe = run120b
+    ? await probeReasoningSettings(
+        GROQ_BASE_URL,
+        cfg.groqApiKey,
+        reliableModel,
+        cfg.groqReliableReasoningEffort ?? "low",
+        true,
+      )
+    : null;
 
   // Preliminary budget guard before running service_tier probes.
-  const qwenRemainingRaw = qwenLowProbe.rateLimitHeaders["x-ratelimit-remaining-requests"];
-  const reliableRemainingRaw = reliableProbe.rateLimitHeaders["x-ratelimit-remaining-requests"];
+  const latestQwenHeaders = qwenLowProbe?.rateLimitHeaders ?? qwenNoneProbe?.rateLimitHeaders ?? {};
+  const qwenRemainingRaw = latestQwenHeaders["x-ratelimit-remaining-requests"];
+  const reliableRemainingRaw = reliableProbe?.rateLimitHeaders["x-ratelimit-remaining-requests"];
   const qwenPreliminaryRem = qwenRemainingRaw && /^\d+$/.test(qwenRemainingRaw) ? Number(qwenRemainingRaw) : null;
   const reliablePreliminaryRem =
     reliableRemainingRaw && /^\d+$/.test(reliableRemainingRaw) ? Number(reliableRemainingRaw) : null;
 
-  const qwenPlannedMax = 2 * (2 * N_TASK3D + 2 * N_TASK3D + 3 * N_TASK3D); // 140 max
-  const reliableMatrixPlannedMax = 2 * N_TASK3D + 2 * N_TASK3D + 3 * N_TASK3D; // 70 max
-
-  if (qwenPreliminaryRem !== null && qwenPreliminaryRem < qwenPlannedMax) {
+  if (runQwen && qwenPreliminaryRem !== null && qwenPreliminaryRem < qwenPlannedMax) {
     throw new Error(
       `Stopping before Task 3d: ${qwenModel} needs up to ${qwenPlannedMax} requests, remaining=${qwenPreliminaryRem}`,
     );
   }
-  if (reliablePreliminaryRem !== null && reliablePreliminaryRem < reliableMatrixPlannedMax + 4) {
+  if (run120b && reliablePreliminaryRem !== null && reliablePreliminaryRem < reliableMatrixPlannedMax + 4) {
     throw new Error(
       `Stopping before Task 3d: ${reliableModel} needs at least ${reliableMatrixPlannedMax + 4} requests, remaining=${reliablePreliminaryRem}`,
     );
   }
 
-  console.log("\n=== Task 3d Part 3b: Probing Groq service_tier values on free tier ===");
-  const tierProbeResult = await probeGroqServiceTiers(cfg.groqApiKey, reliableProbe.probe);
-  for (const tp of tierProbeResult.probes) {
-    console.log(`  service_tier="${tp.tier}": ${tp.allowed ? "ALLOWED" : "REJECTED"} (${tp.detail})`);
+  let tierProbeResult: {
+    readonly probes: readonly ServiceTierProbeResult[];
+    readonly latestHeaders: Record<string, string>;
+  } = { probes: [], latestHeaders: {} };
+  let allowedTiers: GroqServiceTier[] = [];
+  let tiersToBenchmark: GroqServiceTier[] = [];
+
+  if (run120b && reliableProbe) {
+    console.log("\n=== Task 3d Part 3b: Probing Groq service_tier values on free tier ===");
+    tierProbeResult = await probeGroqServiceTiers(cfg.groqApiKey, reliableProbe.probe);
+    for (const tp of tierProbeResult.probes) {
+      console.log(`  service_tier="${tp.tier}": ${tp.allowed ? "ALLOWED" : "REJECTED"} (${tp.detail})`);
+    }
+    allowedTiers = tierProbeResult.probes.filter((p) => p.allowed).map((p) => p.tier);
+    const extraAllowedTiers = allowedTiers.filter((t) => t !== "on_demand");
+    tiersToBenchmark = extraAllowedTiers.length > 0 ? allowedTiers : [];
   }
-  const allowedTiers = tierProbeResult.probes.filter((p) => p.allowed).map((p) => p.tier);
-  const extraAllowedTiers = allowedTiers.filter((t) => t !== "on_demand");
-  const tiersToBenchmark = extraAllowedTiers.length > 0 ? allowedTiers : [];
+
   const serviceTierPlannedReqs = tiersToBenchmark.length * N_TASK3D;
   const reliableTotalPlannedMax = reliableMatrixPlannedMax + serviceTierPlannedReqs;
   const grandTotalPlannedMax = qwenPlannedMax + reliableTotalPlannedMax;
 
   console.log("\n=== Task 3d Planned Request Count (printed before matrix/tier loops) ===");
   console.log(
-    `  Matrix (voice-v2, tool_choice=auto, warm H2, N=${N_TASK3D}/cell, 3 model configs x 5 prompts):`,
+    `  Matrix (voice-v2, tool_choice=auto, warm H2, N=${N_TASK3D}/cell, selected=${selectedIds.join(",")} x 5 prompts):`,
   );
-  console.log(
-    `    - ${qwenModel} (none + low): max ${qwenPlannedMax} reqs (min 100 if 0 tool calls; 20+20+10+10+10 per config)`,
-  );
-  console.log(
-    `    - ${reliableModel} (low): max ${reliableMatrixPlannedMax} reqs (20+20+10+10+10)`,
-  );
-  if (tiersToBenchmark.length === 0) {
+  if (runQwen) {
+    const labelParts = [runQwenNone ? "none" : null, runQwenLow ? "low" : null]
+      .filter((v): v is string => v !== null)
+      .join(" + ");
     console.log(
-      `  Part 3b service_tier check on ${reliableModel}: free tier only permits default "on_demand" (auto/flex/performance rejected 400); skipping extra service_tier loop (0 reqs; default covered by Matrix Plain N=${N_TASK3D})`,
-    );
-  } else {
-    console.log(
-      `  Part 3b service_tier check on ${reliableModel}: ${tiersToBenchmark.length} allowed tiers (${tiersToBenchmark.join(", ")}) x N=${N_TASK3D} = ${serviceTierPlannedReqs} reqs`,
+      `    - ${qwenModel} (${labelParts}): max ${qwenPlannedMax} reqs`,
     );
   }
+  if (run120b) {
+    console.log(
+      `    - ${reliableModel} (low): max ${reliableMatrixPlannedMax} reqs (20+20+10+10+10)`,
+    );
+    if (tiersToBenchmark.length === 0) {
+      console.log(
+        `  Part 3b service_tier check on ${reliableModel}: free tier only permits default "on_demand" (auto/flex/performance rejected 400); skipping extra service_tier loop (0 reqs; default covered by Matrix Plain N=${N_TASK3D})`,
+      );
+    } else {
+      console.log(
+        `  Part 3b service_tier check on ${reliableModel}: ${tiersToBenchmark.length} allowed tiers (${tiersToBenchmark.join(", ")}) x N=${N_TASK3D} = ${serviceTierPlannedReqs} reqs`,
+      );
+    }
+  }
   console.log(
-    `  Total planned loop requests: ${grandTotalPlannedMax} max (${qwenModel}=${qwenPlannedMax}, ${reliableModel}=${reliableTotalPlannedMax})`,
+    `  Total planned loop requests: ${grandTotalPlannedMax} max` +
+      `${runQwen ? ` (${qwenModel}=${qwenPlannedMax})` : ""}` +
+      `${run120b ? ` (${reliableModel}=${reliableTotalPlannedMax})` : ""}`,
   );
 
-  const budgetCandidates: GroqCandidateSpec[] = [
-    {
-      role: "noreason",
-      model: qwenModel,
-      probeWithBudget: {
-        probe: qwenNoneProbe.probe,
-        probeRequestsSpent: qwenNoneProbe.probeRequestsSpent + qwenLowProbe.probeRequestsSpent,
-        rateLimitHeaders: qwenLowProbe.rateLimitHeaders,
-      },
-    },
-    {
+  const budgetCandidates: GroqCandidateSpec[] = [];
+  const plannedMap = new Map<string, number>();
+  if (runQwen) {
+    const qwenProbeForBudget = qwenLowProbe?.probe ?? qwenNoneProbe?.probe;
+    if (qwenProbeForBudget) {
+      budgetCandidates.push({
+        role: "noreason",
+        model: qwenModel,
+        probeWithBudget: {
+          probe: qwenProbeForBudget,
+          probeRequestsSpent:
+            (qwenNoneProbe?.probeRequestsSpent ?? 0) + (qwenLowProbe?.probeRequestsSpent ?? 0),
+          rateLimitHeaders: latestQwenHeaders,
+        },
+      });
+      plannedMap.set("noreason", qwenPlannedMax);
+    }
+  }
+  if (run120b && reliableProbe) {
+    budgetCandidates.push({
       role: "reliable",
       model: reliableModel,
       probeWithBudget: {
@@ -2563,42 +2685,44 @@ async function runTask3dExperiment(): Promise<void> {
             ? tierProbeResult.latestHeaders
             : reliableProbe.rateLimitHeaders,
       },
-    },
-  ];
-  const plannedMap = new Map<string, number>([
-    ["noreason", qwenPlannedMax],
-    ["reliable", reliableTotalPlannedMax],
-  ]);
+    });
+    plannedMap.set("reliable", reliableTotalPlannedMax);
+  }
   const budget = checkGroqRequestBudget(
     groqBase.baseline.rateLimitHeaders,
     budgetCandidates,
     plannedMap,
-    `  Task 3d max loop requests: ${qwenModel}=${qwenPlannedMax}, ${reliableModel}=${reliableTotalPlannedMax} (total=${grandTotalPlannedMax})`,
+    `  Task 3d max loop requests: total=${grandTotalPlannedMax}`,
   );
 
-  const modelSpecs: readonly Task3dModelSpec[] = [
-    {
+  const modelSpecs: Task3dModelSpec[] = [];
+  if (qwenNoneProbe) {
+    modelSpecs.push({
       id: "qwen_none",
       label: "qwen/qwen3.8-27b (reasoning=none)",
       model: qwenModel,
       probe: qwenNoneProbe.probe,
       pacingMs: 4000,
-    },
-    {
+    });
+  }
+  if (qwenLowProbe) {
+    modelSpecs.push({
       id: "qwen_low",
       label: "qwen/qwen3.8-27b (reasoning=low)",
       model: qwenModel,
       probe: qwenLowProbe.probe,
       pacingMs: 4000,
-    },
-    {
+    });
+  }
+  if (reliableProbe) {
+    modelSpecs.push({
       id: "gpt_oss_120b_low",
       label: "openai/gpt-oss-120b (reasoning=low)",
       model: reliableModel,
       probe: reliableProbe.probe,
       pacingMs: 3200,
-    },
-  ];
+    });
+  }
 
   const promptSpecs: readonly Task3dPromptSpec[] = [
     {
@@ -2750,7 +2874,7 @@ async function runTask3dExperiment(): Promise<void> {
       console.log(`[Task3d:Matrix] completed iteration ${i + 1}/${N_TASK3D} in ${elapsedSec} s`);
     }
 
-    if (tiersToBenchmark.length > 0) {
+    if (run120b && tiersToBenchmark.length > 0 && reliableProbe) {
       const reliableEffort =
         reliableProbe.probe.reasoningEffort === "not_applicable"
           ? undefined
@@ -2783,7 +2907,7 @@ async function runTask3dExperiment(): Promise<void> {
   }
 
   console.log(
-    `\n=== Task 3d Matrix Results (prompt=${PROMPT_VERSION_V2}, toolSchema=${TOOL_SCHEMA_VERSION_V2}, tool_choice=auto, warm H2, N=${N_TASK3D}) ===`,
+    `\n=== Task 3d Matrix Results (prompt=${PROMPT_VERSION_V2}, toolSchema=${TOOL_SCHEMA_VERSION_V2}, tool_choice=auto, warm H2, N=${N_TASK3D}, models=${selectedIds.join(",")}) ===`,
   );
   const cellSummaries: Array<ReturnType<typeof summarizeTask3dCell>> = [];
   for (const m of modelSpecs) {
@@ -2796,57 +2920,75 @@ async function runTask3dExperiment(): Promise<void> {
   }
 
   // Part 3a: queue_time min/median/p90/max for openai/gpt-oss-120b runs.
-  const reliablePlainQueueTimes = (cellBuckets.get("gpt_oss_120b_low:plain") ?? [])
-    .map((r) => r.req1ServerQueueMs)
-    .filter((v): v is number => v !== null);
-  const reliableAllReq1QueueTimes = promptSpecs
-    .flatMap((p) => cellBuckets.get(`gpt_oss_120b_low:${p.id}`) ?? [])
-    .map((r) => r.req1ServerQueueMs)
-    .filter((v): v is number => v !== null);
-  const reliableAllReqQueueTimes = promptSpecs
-    .flatMap((p) => cellBuckets.get(`gpt_oss_120b_low:${p.id}`) ?? [])
-    .flatMap((r) => [r.req1ServerQueueMs, r.req2ServerQueueMs])
-    .filter((v): v is number => v !== null);
+  let queueTime120b: {
+    readonly matrixPlain: DistributionStats;
+    readonly matrixAllReq1: DistributionStats;
+    readonly matrixAllRequests: DistributionStats;
+  } | null = null;
+  let serviceTierSummaries: Array<{
+    readonly tier: GroqServiceTier;
+    readonly summary: ReturnType<typeof summarizePlainRuns>;
+  }> = [];
 
-  const queueStatsPlain = summarize(reliablePlainQueueTimes);
-  const queueStatsAllReq1 = summarize(reliableAllReq1QueueTimes);
-  const queueStatsAllReqs = summarize(reliableAllReqQueueTimes);
+  if (run120b) {
+    const reliablePlainQueueTimes = (cellBuckets.get("gpt_oss_120b_low:plain") ?? [])
+      .map((r) => r.req1ServerQueueMs)
+      .filter((v): v is number => v !== null);
+    const reliableAllReq1QueueTimes = promptSpecs
+      .flatMap((p) => cellBuckets.get(`gpt_oss_120b_low:${p.id}`) ?? [])
+      .map((r) => r.req1ServerQueueMs)
+      .filter((v): v is number => v !== null);
+    const reliableAllReqQueueTimes = promptSpecs
+      .flatMap((p) => cellBuckets.get(`gpt_oss_120b_low:${p.id}`) ?? [])
+      .flatMap((r) => [r.req1ServerQueueMs, r.req2ServerQueueMs])
+      .filter((v): v is number => v !== null);
 
-  console.log(`\n=== Task 3d Part 3a: ${reliableModel} queue_time distribution ===`);
-  for (const [label, q] of [
-    ["Matrix Plain (n=10)", queueStatsPlain],
-    ["Matrix All req1 (5 prompts x 10)", queueStatsAllReq1],
-    ["Matrix All requests (req1 + req2)", queueStatsAllReqs],
-  ] as const) {
-    console.log(
-      `  ${label} (count=${q.count}): min=${formatMs(q.min)} | median=${formatMs(q.median)} | p90=${formatMs(q.p90)} | max=${formatMs(q.max)}`,
-    );
-  }
-
-  console.log(`\n=== Task 3d Part 3b: ${reliableModel} service_tier Plain Warm H2 (N=${N_TASK3D}/tier) ===`);
-  if (tiersToBenchmark.length === 0) {
-    console.log(
-      "  Skipped extra service_tier loop: Groq free tier only accepts default service_tier=\"on_demand\" (auto, flex, performance returned HTTP 400).",
-    );
-  }
-  const serviceTierSummaries = tiersToBenchmark.map((tier) => {
-    const s = summarizePlainRuns(serviceTierRuns.get(tier) ?? []);
-    console.log(
-      `  service_tier="${tier}" (n=${s.n}): ` +
-        `queue_time min=${formatMs(s.serverTimings.queueTimeMs.min)} med=${formatMs(s.serverTimings.queueTimeMs.median)} p90=${formatMs(s.serverTimings.queueTimeMs.p90)} max=${formatMs(s.serverTimings.queueTimeMs.max)} | ` +
-        `TTFT(content) med=${formatMs(s.ttftMs.median)} p90=${formatMs(s.ttftMs.p90)} | ` +
-        `FirstToken(any) med=${formatMs(s.firstAnyTokenMs.median)} p90=${formatMs(s.firstAnyTokenMs.p90)}`,
-    );
-    return {
-      tier,
-      summary: s,
+    const queueStatsPlain = summarize(reliablePlainQueueTimes);
+    const queueStatsAllReq1 = summarize(reliableAllReq1QueueTimes);
+    const queueStatsAllReqs = summarize(reliableAllReqQueueTimes);
+    queueTime120b = {
+      matrixPlain: queueStatsPlain,
+      matrixAllReq1: queueStatsAllReq1,
+      matrixAllRequests: queueStatsAllReqs,
     };
-  });
+
+    console.log(`\n=== Task 3d Part 3a: ${reliableModel} queue_time distribution ===`);
+    for (const [label, q] of [
+      ["Matrix Plain (n=10)", queueStatsPlain],
+      ["Matrix All req1 (5 prompts x 10)", queueStatsAllReq1],
+      ["Matrix All requests (req1 + req2)", queueStatsAllReqs],
+    ] as const) {
+      console.log(
+        `  ${label} (count=${q.count}): min=${formatMs(q.min)} | median=${formatMs(q.median)} | p90=${formatMs(q.p90)} | max=${formatMs(q.max)}`,
+      );
+    }
+
+    console.log(`\n=== Task 3d Part 3b: ${reliableModel} service_tier Plain Warm H2 (N=${N_TASK3D}/tier) ===`);
+    if (tiersToBenchmark.length === 0) {
+      console.log(
+        "  Skipped extra service_tier loop: Groq free tier only accepts default service_tier=\"on_demand\" (auto, flex, performance returned HTTP 400).",
+      );
+    }
+    serviceTierSummaries = tiersToBenchmark.map((tier) => {
+      const s = summarizePlainRuns(serviceTierRuns.get(tier) ?? []);
+      console.log(
+        `  service_tier="${tier}" (n=${s.n}): ` +
+          `queue_time min=${formatMs(s.serverTimings.queueTimeMs.min)} med=${formatMs(s.serverTimings.queueTimeMs.median)} p90=${formatMs(s.serverTimings.queueTimeMs.p90)} max=${formatMs(s.serverTimings.queueTimeMs.max)} | ` +
+          `TTFT(content) med=${formatMs(s.ttftMs.median)} p90=${formatMs(s.ttftMs.p90)} | ` +
+          `FirstToken(any) med=${formatMs(s.firstAnyTokenMs.median)} p90=${formatMs(s.firstAnyTokenMs.p90)}`,
+      );
+      return {
+        tier,
+        summary: s,
+      };
+    });
+  }
 
   mkdirSync(OUT_DIR, { recursive: true });
   const payload = {
     timestamp: new Date().toISOString(),
     nodeVersion: process.version,
+    selectedModels: selectedIds,
     promptVersion: PROMPT_VERSION_V2,
     toolSchemaVersion: TOOL_SCHEMA_VERSION_V2,
     comparisonBaseline: {
@@ -2863,24 +3005,27 @@ async function runTask3dExperiment(): Promise<void> {
       reliableTotalPlannedMax,
       grandTotalPlannedMax,
     },
+    tokenBudget,
     budget,
     baselines: {
       groqControlPlane: groqBase.baseline,
     },
     matrixCells: cellSummaries,
-    queueTime120b: {
-      matrixPlain: queueStatsPlain,
-      matrixAllReq1: queueStatsAllReq1,
-      matrixAllRequests: queueStatsAllReqs,
-    },
-    serviceTierCheck: {
-      probes: tierProbeResult.probes,
-      allowedTiers,
-      results: serviceTierSummaries,
-    },
+    queueTime120b,
+    serviceTierCheck: run120b
+      ? {
+          probes: tierProbeResult.probes,
+          allowedTiers,
+          results: serviceTierSummaries,
+        }
+      : null,
   };
-  writeFileSync(TASK3D_RESULTS_PATH, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
-  console.log(`\nSaved Task 3d results to ${TASK3D_RESULTS_PATH}`);
+  const outPath =
+    selectedIds.length === TASK3D_MODEL_IDS.length
+      ? TASK3D_RESULTS_PATH
+      : path.join(OUT_DIR, `task3d-${selectedIds.join("-")}-results.json`);
+  writeFileSync(outPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  console.log(`\nSaved Task 3d results to ${outPath}`);
 }
 
 async function main(): Promise<void> {
@@ -2899,6 +3044,14 @@ async function main(): Promise<void> {
 
   loadEnvFromRoot();
   const cfg: SpikeEnvConfig = loadSpikeConfig(process.env);
+
+  checkGroqTokenBudget([
+    { model: cfg.groqModelFast, plannedRequests: N_RUNS * GROQ_REQUESTS_PER_ITERATION + 2 },
+    { model: cfg.groqModelReliable, plannedRequests: N_RUNS * GROQ_REQUESTS_PER_ITERATION + 2 },
+    ...(cfg.groqModelNoReason
+      ? [{ model: cfg.groqModelNoReason, plannedRequests: N_RUNS * GROQ_REQUESTS_PER_ITERATION + 2 }]
+      : []),
+  ]);
 
   const groqBase = await measureBaseline("Groq", GROQ_BASE_URL, cfg.groqApiKey);
   console.log(`Groq live models (${groqBase.modelIds.length}): ${groqBase.modelIds.join(", ")}`);

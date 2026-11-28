@@ -137,6 +137,67 @@ export const PROMPT_PROFILES: Readonly<Record<PromptVersion, PromptProfile>> = {
 export const GROQ_SERVICE_TIERS = ["on_demand", "auto", "flex", "performance"] as const;
 export type GroqServiceTier = (typeof GROQ_SERVICE_TIERS)[number];
 
+export const TASK3D_MODEL_IDS = ["qwen_none", "qwen_low", "gpt_oss_120b_low"] as const;
+export type Task3dModelId = (typeof TASK3D_MODEL_IDS)[number];
+
+const TASK3D_MODEL_ALIASES: Readonly<Record<string, readonly Task3dModelId[]>> = {
+  all: TASK3D_MODEL_IDS,
+  qwen: ["qwen_none", "qwen_low"],
+  "qwen/qwen3.8-27b": ["qwen_none", "qwen_low"],
+  qwen_none: ["qwen_none"],
+  qwen_low: ["qwen_low"],
+  "120b": ["gpt_oss_120b_low"],
+  "gpt-oss-120b": ["gpt_oss_120b_low"],
+  "openai/gpt-oss-120b": ["gpt_oss_120b_low"],
+  gpt_oss_120b_low: ["gpt_oss_120b_low"],
+};
+
+/**
+ * Parses `--models=...` (or `--models ...`) for `--task3d` runs.
+ * Defaults to all Task 3d model configs when omitted.
+ */
+export function parseTask3dModelFilter(argv: readonly string[]): readonly Task3dModelId[] {
+  let rawValue: string | null = null;
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i] ?? "";
+    if (arg.startsWith("--models=")) {
+      rawValue = arg.slice("--models=".length);
+    } else if (arg === "--models") {
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith("--")) {
+        throw new Error("--models requires a comma-separated value (e.g. 120b, qwen, all)");
+      }
+      rawValue = next;
+      i += 1;
+    }
+  }
+  if (rawValue === null) {
+    return TASK3D_MODEL_IDS;
+  }
+
+  const tokens = rawValue
+    .split(",")
+    .map((t) => t.trim().toLowerCase())
+    .filter((t) => t.length > 0);
+  if (tokens.length === 0) {
+    throw new Error("--models cannot be empty (valid: all, 120b, qwen, qwen_none, qwen_low)");
+  }
+
+  const selected = new Set<Task3dModelId>();
+  for (const token of tokens) {
+    const mapped = TASK3D_MODEL_ALIASES[token];
+    if (mapped === undefined) {
+      throw new Error(
+        `Unknown --models target '${token}' (valid: all, 120b, qwen, qwen_none, qwen_low, openai/gpt-oss-120b, qwen/qwen3.8-27b)`,
+      );
+    }
+    for (const id of mapped) {
+      selected.add(id);
+    }
+  }
+  return TASK3D_MODEL_IDS.filter((id) => selected.has(id));
+}
+
 export const ReasoningEffortSchema = z.enum(["none", "minimal", "low", "medium", "high"]);
 export type ReasoningEffort = z.infer<typeof ReasoningEffortSchema>;
 
