@@ -90,9 +90,9 @@ pnpm --dir spikes/deepgram-tts live -- --spoken-id-check             # 109 chars
 - All `160/160` synthesized WS & REST streams passed `checkRawPcm24kFormat` (`0` `RIFF` headers, `0` odd-byte buffers, `160/160` plausible duration).
 - Saved WAVs in `spikes/deepgram-tts/out/` (gitignored): `order-1042-in-ws.wav` (`2920 ms`), `long-20w-in-ws.wav` (`6600 ms`), `order-1042-default-ws.wav` (`2840 ms`), `long-20w-default-ws.wav` (`6160 ms`), `order-1042-in-rest.wav` (`2880 ms`), `order-1042-default-rest.wav` (`2920 ms`), `time-345pm-in-ws.wav` (`2440 ms`), `time-345pm-default-ws.wav` (`2480 ms`).
 - **Spoken-form order ID WAVs (`--spoken-id-check`, `api.in.deepgram.com`, `109` chars total):**
-  - `order-1042-spoken-words-in-ws.wav` (`2360 ms`, `flush->1st=101.5 ms`): `"Your order one zero four two has shipped."`
-  - `order-1042-spaced-digits-in-ws.wav` (`2800 ms`, `flush->1st=106.1 ms`): `"Your order 1 0 4 2 has shipped."`
-  - `order-1042-ten-forty-two-in-ws.wav` (`2280 ms`, `flush->1st=106.3 ms`): `"Your order ten forty-two has shipped."`
+  - `order-1042-spoken-words-in-ws.wav` (`2520 ms`, `flush->1st=108.4 ms`): `"Your order one zero four two has shipped."`
+  - `order-1042-spaced-digits-in-ws.wav` (`2200 ms`, `flush->1st=101.9 ms`): `"Your order 1 0 4 2 has shipped."`
+  - `order-1042-ten-forty-two-in-ws.wav` (`2240 ms`, `flush->1st=100.5 ms`): `"Your order ten forty-two has shipped."`
 - **Deepgram TTS text-normalization & pronunciation docs:**
   - **Text-normalization API flag:** none found for Aura-2 (`/v1/speak`). (`normalize_volume` in [`tts-voice-controls`](https://developers.deepgram.com/docs/tts-voice-controls) is audio loudness normalization on Flux TTS `/v2/speak` only — `Not supported` on Aura-2. [`improving-aura-2-formatting`](https://developers.deepgram.com/docs/improving-aura-2-formatting) and [`text-to-speech-prompting`](https://developers.deepgram.com/docs/text-to-speech-prompting) rely on formatting the input text itself.)
   - **Pronunciation option:** Aura-2 (`/v1/speak`) supports per-word inline IPA overrides (`\{"word": "...", "pronounce": "..."\}`), documented in [`tts-voice-controls`](https://developers.deepgram.com/docs/tts-voice-controls):
