@@ -1,9 +1,21 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_MODELS_PATH,
+  NEAR_MISS_SHIPPING_PROMPT,
+  NEAR_MISS_TIME_PROMPT,
+  PROMPT_PROFILES,
   PROMPT_VERSION,
+  PROMPT_VERSION_V1,
+  PROMPT_VERSION_V2,
   SYSTEM_PROMPT,
+  SYSTEM_PROMPT_V1,
+  SYSTEM_PROMPT_V2,
+  TIME_TOOL_PROMPT_V2,
+  TOOL_SCHEMA_VERSION_V1,
+  TOOL_SCHEMA_VERSION_V2,
   VOICE_TOOLS,
+  VOICE_TOOLS_V1,
+  VOICE_TOOLS_V2,
   loadApiKeysConfig,
   loadModelsFile,
   loadSpikeConfig,
@@ -36,6 +48,33 @@ describe("config", () => {
       "get_order_status",
       "get_current_time",
     ]);
+  });
+
+  it("keeps voice-v1 and defines voice-v2 prompt and tool schema profiles", () => {
+    expect(PROMPT_PROFILES["voice-v1"]).toEqual({
+      promptVersion: PROMPT_VERSION_V1,
+      toolSchemaVersion: TOOL_SCHEMA_VERSION_V1,
+      systemPrompt: SYSTEM_PROMPT_V1,
+      tools: VOICE_TOOLS_V1,
+    });
+    expect(PROMPT_PROFILES["voice-v2"]).toEqual({
+      promptVersion: PROMPT_VERSION_V2,
+      toolSchemaVersion: TOOL_SCHEMA_VERSION_V2,
+      systemPrompt: SYSTEM_PROMPT_V2,
+      tools: VOICE_TOOLS_V2,
+    });
+    expect(SYSTEM_PROMPT_V2.startsWith(SYSTEM_PROMPT_V1)).toBe(true);
+    expect(SYSTEM_PROMPT_V2).toContain("Never ask for a timezone");
+    expect(SYSTEM_PROMPT_V2).toContain(
+      "Never say you are checking something unless you call the tool in the same reply.",
+    );
+    expect(VOICE_TOOLS_V2[1]?.function.description).toContain("Asia/Kolkata");
+    expect(VOICE_TOOLS_V1[1]?.function.description).toBe(
+      "Get the current time, optionally for a given IANA timezone.",
+    );
+    expect(TIME_TOOL_PROMPT_V2).toBe("Thanks, what time is it right now?");
+    expect(NEAR_MISS_TIME_PROMPT).toBe("What's a good time of day to call customer support?");
+    expect(NEAR_MISS_SHIPPING_PROMPT).toBe("How long does shipping usually take?");
   });
 
   it("loads valid models.json schema from disk", () => {

@@ -381,3 +381,26 @@ export function validateCurrentTimeToolCalls(
 ): ToolValidationResult {
   return validateToolCallWithSchema(toolCalls, "get_current_time", CurrentTimeArgsSchema);
 }
+
+const CLAIMED_CHECK_PATTERN =
+  /\b(?:checking|let me check|let me look(?:\s+(?:that|this|it))?\s+up|let me verify|i(?:'ll| will| am|'m)\s+(?:check|look(?:\s+(?:that|this|it))?\s+up|verify)|looking\s+(?:that|this|it)\s+up)\b/i;
+
+/**
+ * Detects replies that claim to be checking or looking something up
+ * when no tool call was actually emitted.
+ */
+export function detectClaimedCheckWithoutToolCall(
+  content: string,
+  toolCallCount: number,
+): boolean {
+  if (toolCallCount > 0) return false;
+  return CLAIMED_CHECK_PATTERN.test(content);
+}
+
+/**
+ * Returns true when an HTTP 429 body indicates a daily token/request quota
+ * (TPD/RPD) rather than a short per-minute (RPM/TPM) burst limit.
+ */
+export function isDailyRateLimitBody(bodyText: string): boolean {
+  return /\((?:TPD|RPD)\)|tokens per day|requests per day/i.test(bodyText);
+}

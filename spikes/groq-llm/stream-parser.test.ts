@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   GroqStreamAccumulator,
+  detectClaimedCheckWithoutToolCall,
+  isDailyRateLimitBody,
   validateCurrentTimeToolCalls,
   validateOrderStatusToolCalls,
 } from "./stream-parser.js";
@@ -276,5 +278,40 @@ describe("GroqStreamAccumulator", () => {
         },
       ]).reason,
     ).toBe("wrong_tool:get_order_status");
+  });
+
+  it("detects replies claiming to check without a tool call", () => {
+    expect(
+      detectClaimedCheckWithoutToolCall("I'm checking the status of order 1042 right now.", 0),
+    ).toBe(true);
+    expect(detectClaimedCheckWithoutToolCall("Let me check that for you.", 0)).toBe(true);
+    expect(detectClaimedCheckWithoutToolCall("I'll look that up right away.", 0)).toBe(true);
+    expect(detectClaimedCheckWithoutToolCall("Let me check that for you.", 1)).toBe(false);
+    expect(
+      detectClaimedCheckWithoutToolCall(
+        "You can check your confirmation email for tracking details.",
+        0,
+      ),
+    ).toBe(false);
+    expect(
+      detectClaimedCheckWithoutToolCall(
+        "Standard shipping usually takes three to five business days.",
+        0,
+      ),
+    ).toBe(false);
+  });
+
+  it("distinguishes daily TPD/RPD 429 errors from short TPM/RPM bursts", () => {
+    expect(
+      isDailyRateLimitBody(
+        '{"error":{"message":"Rate limit reached for model `qwen/qwen3.8-27b` on tokens per day (TPD): Limit 200000, Used 199622"}}',
+      ),
+    ).toBe(true);
+    expect(
+      isDailyRateLimitBody('{"error":{"message":"Rate limit reached on requests per day (RPD)"}}'),
+    ).toBe(true);
+    expect(
+      isDailyRateLimitBody('{"error":{"message":"Rate limit reached on tokens per minute (TPM)"}}'),
+    ).toBe(false);
   });
 });

@@ -8,16 +8,27 @@ import { Agent, buildConnector, fetch, type Dispatcher, type Response } from "un
 import { ZodError } from "zod";
 import {
   CurrentTimeArgsSchema,
+  GROQ_SERVICE_TIERS,
+  NEAR_MISS_SHIPPING_PROMPT,
+  NEAR_MISS_TIME_PROMPT,
   ORDER_TOOL_PROMPT,
   OrderStatusArgsSchema,
   PLAIN_PROMPT,
   PROMPT_VERSION,
+  PROMPT_VERSION_V2,
   SYSTEM_PROMPT,
+  SYSTEM_PROMPT_V2,
   TIME_TOOL_PROMPT,
+  TIME_TOOL_PROMPT_V2,
+  TOOL_SCHEMA_VERSION_V1,
+  TOOL_SCHEMA_VERSION_V2,
   VOICE_TOOLS,
+  VOICE_TOOLS_V2,
   loadApiKeysConfig,
   loadSpikeConfig,
   parseDotEnv,
+  type GroqServiceTier,
+  type OpenAiToolDefinition,
   type ReasoningEffort,
   type SpikeEnvConfig,
 } from "./config.js";
@@ -26,6 +37,8 @@ import { SseParser } from "./sse.js";
 import { formatMs, formatPct, summarize, type DistributionStats } from "./stats.js";
 import {
   GroqStreamAccumulator,
+  detectClaimedCheckWithoutToolCall,
+  isDailyRateLimitBody,
   validateCurrentTimeToolCalls,
   validateOrderStatusToolCalls,
   type AssembledToolCall,
@@ -38,6 +51,7 @@ const REPO_ROOT = path.resolve(__dirname, "../..");
 const OUT_DIR = path.join(__dirname, "out");
 const RESULTS_PATH = path.join(OUT_DIR, "results.json");
 const TASK3C_RESULTS_PATH = path.join(OUT_DIR, "task3c-results.json");
+const TASK3D_RESULTS_PATH = path.join(OUT_DIR, "task3d-results.json");
 
 const GROQ_BASE_URL = "https://api.groq.com/openai/v1";
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai";
@@ -45,6 +59,7 @@ const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai
 const N_BASELINE = 10;
 const N_RUNS = 20;
 const N_TASK3C = 10;
+const N_TASK3D = 10;
 const GROQ_REQUESTS_PER_ITERATION = 11; // A(1) + B(1) + B-h2(1) + C-time(2) + C-order(2) + D-h1(2) + D-h2(2)
 const GROQ_PACING_MS = 2400; // <= 25 RPM per model (free tier: 30 RPM, 8,000 TPM)
 const GEMINI_PACING_MS = 4100;
@@ -188,6 +203,8 @@ interface ToolRunSample {
   readonly req1FirstAnyTokenMs: number | null;
   readonly req1Content: string;
   readonly req1FinishReason: string | null;
+  readonly req1ServerQueueMs: number | null;
+  readonly req2ServerQueueMs: number | null;
   readonly tToolCallMs: number | null;
   readonly tExecMs: number | null;
   readonly followupTtftMs: number | null;
@@ -504,12 +521,14 @@ interface ChatRequestOptions {
   readonly baseUrl: string;
   readonly apiKey: string;
   readonly model: string;
+  readonly systemPrompt?: string;
   readonly prompt?: string;
   readonly messages?: readonly ChatMessage[];
-  readonly tools: typeof VOICE_TOOLS | undefined;
+  readonly tools: readonly OpenAiToolDefinition[] | undefined;
   readonly toolChoice?: ToolChoiceOption;
   readonly reasoningEffort?: ReasoningEffort | "default" | undefined;
   readonly reasoningFormat?: "parsed" | "default" | undefined;
+  readonly serviceTier?: GroqServiceTier | undefined;
   readonly instr: InstrumentedAgent;
   readonly maxTokens?: number;
   readonly abortOnFirstContent?: boolean;
@@ -588,12 +607,21 @@ function assertWarmConnection(label: string, conn: RequestConnectionMetrics): vo
 function buildChatRequestBody(
   opts: Pick<
     ChatRequestOptions,
-    "model" | "prompt" | "messages" | "tools" | "toolChoice" | "reasoningEffort" | "reasoningFormat" | "maxTokens"
+    | "model"
+    | "systemPrompt"
+    | "prompt"
+    | "messages"
+    | "tools"
+    | "toolChoice"
+    | "reasoningEffort"
+    | "reasoningFormat"
+    | "serviceTier"
+    | "maxTokens"
   >,
 ): Record<string, unknown> {
   const messages: readonly ChatMessage[] =
     opts.messages ?? [
-      { role: "system", content: SYSTEM_PROMPT },
+      { role: "system", content: opts.systemPrompt ?? SYSTEM_PROMPT },
       { role: "user", content: opts.prompt ?? PLAIN_PROMPT },
     ];
   const bodyObj: Record<string, unknown> = {
@@ -613,6 +641,9 @@ function buildChatRequestBody(
   }
   if (opts.reasoningFormat === "parsed") {
     bodyObj.reasoning_format = "parsed";
+  }
+  if (opts.serviceTier !== undefined) {
+    bodyObj.service_tier = opts.serviceTier;
   }
   return bodyObj;
 }
@@ -643,6 +674,11 @@ async function runStreamingChat(opts: ChatRequestOptions): Promise<ChatStreamOut
       break;
     }
     const errText = await res.text();
+    if (isDailyRateLimitBody(errText)) {
+      throw new Error(
+        `Daily quota exhausted on ${opts.model} (429): ${errText}`,
+      );
+    }
     if (attempt === MAX_RATE_LIMIT_RETRIES) {
       throw new Error(
         `POST ${opts.baseUrl}/chat/completions (${opts.model}) failed ${res.status}: ${errText}`,
@@ -818,7 +854,7 @@ function executeLocalTool(toolCall: AssembledToolCall): {
   let payload: Record<string, unknown>;
   if (toolCall.name === "get_current_time") {
     const parsed = CurrentTimeArgsSchema.safeParse(toolCall.parsedArguments);
-    const requestedTz = parsed.success ? (parsed.data.timezone ?? "UTC") : "UTC";
+    const requestedTz = parsed.success ? (parsed.data.timezone ?? "Asia/Kolkata") : "Asia/Kolkata";
     let usedTz = requestedTz;
     let formatted: string;
     try {
@@ -1192,19 +1228,28 @@ async function runToolTurn(
   validate: (toolCalls: readonly AssembledToolCall[]) => ToolValidationResult,
   label: string,
   toolChoiceReq1: ToolChoiceOption = "auto",
+  options: {
+    readonly systemPrompt?: string;
+    readonly tools?: readonly OpenAiToolDefinition[];
+    readonly serviceTier?: GroqServiceTier;
+  } = {},
 ): Promise<ToolRunSample> {
   const reasoningEffort =
     probe.reasoningEffort === "not_applicable" ? undefined : probe.reasoningEffort;
+  const systemPrompt = options.systemPrompt ?? SYSTEM_PROMPT;
+  const tools = options.tools ?? VOICE_TOOLS;
 
   const req1 = await runStreamingChat({
     baseUrl: GROQ_BASE_URL,
     apiKey,
     model: probe.model,
+    systemPrompt,
     prompt,
-    tools: VOICE_TOOLS,
+    tools,
     toolChoice: toolChoiceReq1,
     reasoningEffort,
     reasoningFormat: probe.reasoningFormat,
+    serviceTier: options.serviceTier,
     instr: warmInstr,
   });
   assertWarmConnection(`${label}:req1`, req1.connection);
@@ -1216,6 +1261,7 @@ async function runToolTurn(
   let followupSucceeded = false;
   let e2eMs: number | null = null;
   let req2Connection: RequestConnectionMetrics | null = null;
+  let req2ServerQueueMs: number | null = null;
   let reasoningTokensReq2 = 0;
   let totalMs = req1.totalMs;
   let cfRayLocation = req1.cfRayLocation;
@@ -1237,7 +1283,7 @@ async function runToolTurn(
     tExecMs = execAccum;
 
     const followupMessages: ChatMessage[] = [
-      { role: "system", content: SYSTEM_PROMPT },
+      { role: "system", content: systemPrompt },
       { role: "user", content: prompt },
       {
         role: "assistant",
@@ -1259,15 +1305,17 @@ async function runToolTurn(
       apiKey,
       model: probe.model,
       messages: followupMessages,
-      tools: VOICE_TOOLS,
+      tools,
       toolChoice: "auto",
       reasoningEffort,
       reasoningFormat: probe.reasoningFormat,
+      serviceTier: options.serviceTier,
       instr: warmInstr,
     });
     assertWarmConnection(`${label}:req2`, req2.connection);
 
     req2Connection = req2.connection;
+    req2ServerQueueMs = req2.parsed.usage.queueTimeMs;
     followupTtftMs = req2.ttftMs;
     followupFirstSentenceAbsMs = req2.firstSentenceAbsMs;
     followupSucceeded = req2.ttftMs !== null && req2.parsed.toolCalls.length === 0;
@@ -1290,6 +1338,8 @@ async function runToolTurn(
     req1FirstAnyTokenMs: req1.firstAnyTokenMs,
     req1Content: req1.parsed.content,
     req1FinishReason: req1.parsed.finishReason,
+    req1ServerQueueMs: req1.parsed.usage.queueTimeMs,
+    req2ServerQueueMs,
     tToolCallMs: req1.toolCallAssembledMs,
     tExecMs,
     followupTtftMs,
@@ -2195,6 +2245,7 @@ async function runTask3cDiagnosis(): Promise<void> {
     timestamp: new Date().toISOString(),
     nodeVersion: process.version,
     promptVersion: PROMPT_VERSION,
+    toolSchemaVersion: TOOL_SCHEMA_VERSION_V1,
     nTask3c: N_TASK3C,
     budget,
     baselines: {
@@ -2216,6 +2267,622 @@ async function runTask3cDiagnosis(): Promise<void> {
   console.log(`\nSaved Task 3c results to ${TASK3C_RESULTS_PATH}`);
 }
 
+interface Task3dPromptSpec {
+  readonly id: "c_time" | "c_order" | "plain" | "near_miss_1" | "near_miss_2";
+  readonly label: string;
+  readonly prompt: string;
+  readonly expectTool: string | null;
+  readonly validate?: (toolCalls: readonly AssembledToolCall[]) => ToolValidationResult;
+}
+
+interface Task3dModelSpec {
+  readonly id: "qwen_none" | "qwen_low" | "gpt_oss_120b_low";
+  readonly label: string;
+  readonly model: string;
+  readonly probe: ModelProbeResult;
+  readonly pacingMs: number;
+}
+
+interface Task3dCellSample {
+  readonly correct: boolean;
+  readonly calledAnyTool: boolean;
+  readonly wrongOrUnwantedToolCall: boolean;
+  readonly claimedToCheckWithoutToolCall: boolean;
+  readonly emittedPreToolFiller: boolean;
+  readonly followupSucceeded: boolean | null;
+  readonly failureReason: string | null;
+  readonly req1Content: string;
+  readonly req1FinishReason: string | null;
+  readonly req1FirstAnyTokenMs: number | null;
+  readonly req1TtftMs: number | null;
+  readonly tToolCallMs: number | null;
+  readonly followupTtftMs: number | null;
+  readonly e2eMs: number | null;
+  readonly req1ServerQueueMs: number | null;
+  readonly req2ServerQueueMs: number | null;
+  readonly groqRegion: string | null;
+  readonly cfRayLocation: string | null;
+}
+
+interface ServiceTierProbeResult {
+  readonly tier: GroqServiceTier;
+  readonly allowed: boolean;
+  readonly detail: string;
+}
+
+function summarizeTask3dCell(
+  modelSpec: Task3dModelSpec,
+  promptSpec: Task3dPromptSpec,
+  runs: readonly Task3dCellSample[],
+) {
+  const correctCount = runs.filter((r) => r.correct).length;
+  const wrongOrUnwantedCount = runs.filter((r) => r.wrongOrUnwantedToolCall).length;
+  const claimedToCheckRuns = runs.filter((r) => r.claimedToCheckWithoutToolCall);
+  const fillerRuns = runs.filter((r) => r.emittedPreToolFiller);
+  const followupTotal = runs.filter((r) => r.followupSucceeded !== null).length;
+  const followupOk = runs.filter((r) => r.followupSucceeded === true).length;
+
+  const req1FirstTokens = runs
+    .map((r) => r.req1FirstAnyTokenMs)
+    .filter((v): v is number => v !== null);
+  const req1Ttfts = runs.map((r) => r.req1TtftMs).filter((v): v is number => v !== null);
+  const tToolCalls = runs.map((r) => r.tToolCallMs).filter((v): v is number => v !== null);
+  const followupTtfts = runs.map((r) => r.followupTtftMs).filter((v): v is number => v !== null);
+  const e2es = runs.map((r) => r.e2eMs).filter((v): v is number => v !== null);
+  const req1QueueTimes = runs
+    .map((r) => r.req1ServerQueueMs)
+    .filter((v): v is number => v !== null);
+
+  return {
+    modelId: modelSpec.id,
+    modelLabel: modelSpec.label,
+    model: modelSpec.model,
+    reasoningEffort: modelSpec.probe.reasoningEffort,
+    promptId: promptSpec.id,
+    promptLabel: promptSpec.label,
+    prompt: promptSpec.prompt,
+    expectTool: promptSpec.expectTool,
+    n: runs.length,
+    correctCount,
+    correctRate: formatPct(correctCount, runs.length),
+    wrongOrUnwantedToolCallCount: wrongOrUnwantedCount,
+    wrongOrUnwantedToolCallRate: formatPct(wrongOrUnwantedCount, runs.length),
+    claimedToCheckCount: claimedToCheckRuns.length,
+    claimedToCheckRate: formatPct(claimedToCheckRuns.length, runs.length),
+    claimedToCheckSamples: claimedToCheckRuns.slice(0, 3).map((r) => r.req1Content),
+    preToolFillerCount: fillerRuns.length,
+    preToolFillerRate: formatPct(fillerRuns.length, runs.length),
+    preToolFillerSamples: fillerRuns.slice(0, 3).map((r) => r.req1Content),
+    followupSucceededCount: followupOk,
+    followupSuccessRate: followupTotal > 0 ? formatPct(followupOk, followupTotal) : null,
+    req1FirstAnyTokenMs: summarize(req1FirstTokens),
+    req1TtftMs: summarize(req1Ttfts),
+    tToolCallMs: summarize(tToolCalls),
+    followupTtftMs: summarize(followupTtfts),
+    e2eMs: summarize(e2es),
+    req1QueueTimeMs: summarize(req1QueueTimes),
+    failureReasons: runs
+      .map((r) => r.failureReason)
+      .filter((v): v is string => v !== null),
+    noToolReplySamples: runs
+      .filter((r) => !r.calledAnyTool && r.req1Content.length > 0)
+      .slice(0, 3)
+      .map((r) => ({
+        content: r.req1Content,
+        finishReason: r.req1FinishReason,
+        claimedToCheck: r.claimedToCheckWithoutToolCall,
+      })),
+  };
+}
+
+function printTask3dCellSummary(c: ReturnType<typeof summarizeTask3dCell>): void {
+  const e2eStr =
+    c.expectTool !== null
+      ? `e2e(med/p90)=${formatMs(c.e2eMs.median)} / ${formatMs(c.e2eMs.p90)} | ` +
+        `t_toolcall=${formatMs(c.tToolCallMs.median)} | followup_ttft=${formatMs(c.followupTtftMs.median)} | FollowupOK=${c.followupSuccessRate ?? "n/a"}`
+      : `e2e=n/a (no-tool path) | req1_ttft(content)=${formatMs(c.req1TtftMs.median)} / ${formatMs(c.req1TtftMs.p90)}`;
+  console.log(
+    `  [${c.modelLabel}] ${c.promptLabel} (n=${c.n}, expect=${c.expectTool ?? "none"}):`,
+  );
+  console.log(
+    `    Correct=${c.correctRate} | Wrong/UnwantedTool=${c.wrongOrUnwantedToolCallRate} | ` +
+      `ClaimedCheckNoTool=${c.claimedToCheckRate} | PreToolFiller=${c.preToolFillerRate}`,
+  );
+  console.log(
+    `    req1_first_token(med/p90)=${formatMs(c.req1FirstAnyTokenMs.median)} / ${formatMs(c.req1FirstAnyTokenMs.p90)} | ${e2eStr}`,
+  );
+  if (c.preToolFillerSamples.length > 0) {
+    c.preToolFillerSamples.forEach((sample, idx) => {
+      console.log(`    PreToolFillerSample[${idx + 1}]: ${JSON.stringify(sample)}`);
+    });
+  }
+  if (c.claimedToCheckSamples.length > 0) {
+    c.claimedToCheckSamples.forEach((sample, idx) => {
+      console.log(`    ClaimedCheckSample[${idx + 1}]: ${JSON.stringify(sample)}`);
+    });
+  }
+  if (c.failureReasons.length > 0) {
+    console.log(`    Failures: ${c.failureReasons.join(", ")}`);
+  }
+}
+
+async function probeGroqServiceTiers(
+  apiKey: string,
+  reliableProbe: ModelProbeResult,
+): Promise<{
+  readonly probes: readonly ServiceTierProbeResult[];
+  readonly latestHeaders: Record<string, string>;
+}> {
+  const instr = createInstrumentedAgent(true);
+  const probes: ServiceTierProbeResult[] = [];
+  let latestHeaders: Record<string, string> = {};
+  const reasoningEffort =
+    reliableProbe.reasoningEffort === "not_applicable" ? undefined : reliableProbe.reasoningEffort;
+
+  try {
+    await listModels(GROQ_BASE_URL, apiKey, instr.agent);
+    for (const tier of GROQ_SERVICE_TIERS) {
+      try {
+        const res = await runStreamingChat({
+          baseUrl: GROQ_BASE_URL,
+          apiKey,
+          model: reliableProbe.model,
+          systemPrompt: SYSTEM_PROMPT_V2,
+          prompt: PLAIN_PROMPT,
+          tools: undefined,
+          reasoningEffort,
+          reasoningFormat: reliableProbe.reasoningFormat,
+          serviceTier: tier,
+          instr,
+          maxTokens: 16,
+        });
+        if (Object.keys(res.rateLimitHeaders).length > 0) {
+          latestHeaders = res.rateLimitHeaders;
+        }
+        probes.push({ tier, allowed: true, detail: "HTTP 200 OK" });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        probes.push({ tier, allowed: false, detail: msg });
+      }
+      await sleep(2500);
+    }
+  } finally {
+    await instr.close();
+  }
+  return { probes, latestHeaders };
+}
+
+async function runTask3dExperiment(): Promise<void> {
+  loadEnvFromRoot();
+  const cfg: SpikeEnvConfig = loadSpikeConfig(process.env);
+  if (!cfg.groqModelNoReason) {
+    throw new Error("GROQ_MODEL_NOREASON is required for --task3d");
+  }
+  const qwenModel = cfg.groqModelNoReason;
+  const reliableModel = cfg.groqModelReliable;
+
+  const groqBase = await measureBaseline("Groq", GROQ_BASE_URL, cfg.groqApiKey);
+  assertModelsPresent("Groq", [qwenModel, reliableModel], groqBase.modelIds);
+
+  const qwenNoneProbe = await probeReasoningSettings(
+    GROQ_BASE_URL,
+    cfg.groqApiKey,
+    qwenModel,
+    "none",
+    true,
+  );
+  const qwenLowProbe = await probeReasoningSettings(
+    GROQ_BASE_URL,
+    cfg.groqApiKey,
+    qwenModel,
+    "low",
+    true,
+  );
+  const reliableProbe = await probeReasoningSettings(
+    GROQ_BASE_URL,
+    cfg.groqApiKey,
+    reliableModel,
+    cfg.groqReliableReasoningEffort ?? "low",
+    true,
+  );
+
+  // Preliminary budget guard before running service_tier probes.
+  const qwenRemainingRaw = qwenLowProbe.rateLimitHeaders["x-ratelimit-remaining-requests"];
+  const reliableRemainingRaw = reliableProbe.rateLimitHeaders["x-ratelimit-remaining-requests"];
+  const qwenPreliminaryRem = qwenRemainingRaw && /^\d+$/.test(qwenRemainingRaw) ? Number(qwenRemainingRaw) : null;
+  const reliablePreliminaryRem =
+    reliableRemainingRaw && /^\d+$/.test(reliableRemainingRaw) ? Number(reliableRemainingRaw) : null;
+
+  const qwenPlannedMax = 2 * (2 * N_TASK3D + 2 * N_TASK3D + 3 * N_TASK3D); // 140 max
+  const reliableMatrixPlannedMax = 2 * N_TASK3D + 2 * N_TASK3D + 3 * N_TASK3D; // 70 max
+
+  if (qwenPreliminaryRem !== null && qwenPreliminaryRem < qwenPlannedMax) {
+    throw new Error(
+      `Stopping before Task 3d: ${qwenModel} needs up to ${qwenPlannedMax} requests, remaining=${qwenPreliminaryRem}`,
+    );
+  }
+  if (reliablePreliminaryRem !== null && reliablePreliminaryRem < reliableMatrixPlannedMax + 4) {
+    throw new Error(
+      `Stopping before Task 3d: ${reliableModel} needs at least ${reliableMatrixPlannedMax + 4} requests, remaining=${reliablePreliminaryRem}`,
+    );
+  }
+
+  console.log("\n=== Task 3d Part 3b: Probing Groq service_tier values on free tier ===");
+  const tierProbeResult = await probeGroqServiceTiers(cfg.groqApiKey, reliableProbe.probe);
+  for (const tp of tierProbeResult.probes) {
+    console.log(`  service_tier="${tp.tier}": ${tp.allowed ? "ALLOWED" : "REJECTED"} (${tp.detail})`);
+  }
+  const allowedTiers = tierProbeResult.probes.filter((p) => p.allowed).map((p) => p.tier);
+  const extraAllowedTiers = allowedTiers.filter((t) => t !== "on_demand");
+  const tiersToBenchmark = extraAllowedTiers.length > 0 ? allowedTiers : [];
+  const serviceTierPlannedReqs = tiersToBenchmark.length * N_TASK3D;
+  const reliableTotalPlannedMax = reliableMatrixPlannedMax + serviceTierPlannedReqs;
+  const grandTotalPlannedMax = qwenPlannedMax + reliableTotalPlannedMax;
+
+  console.log("\n=== Task 3d Planned Request Count (printed before matrix/tier loops) ===");
+  console.log(
+    `  Matrix (voice-v2, tool_choice=auto, warm H2, N=${N_TASK3D}/cell, 3 model configs x 5 prompts):`,
+  );
+  console.log(
+    `    - ${qwenModel} (none + low): max ${qwenPlannedMax} reqs (min 100 if 0 tool calls; 20+20+10+10+10 per config)`,
+  );
+  console.log(
+    `    - ${reliableModel} (low): max ${reliableMatrixPlannedMax} reqs (20+20+10+10+10)`,
+  );
+  if (tiersToBenchmark.length === 0) {
+    console.log(
+      `  Part 3b service_tier check on ${reliableModel}: free tier only permits default "on_demand" (auto/flex/performance rejected 400); skipping extra service_tier loop (0 reqs; default covered by Matrix Plain N=${N_TASK3D})`,
+    );
+  } else {
+    console.log(
+      `  Part 3b service_tier check on ${reliableModel}: ${tiersToBenchmark.length} allowed tiers (${tiersToBenchmark.join(", ")}) x N=${N_TASK3D} = ${serviceTierPlannedReqs} reqs`,
+    );
+  }
+  console.log(
+    `  Total planned loop requests: ${grandTotalPlannedMax} max (${qwenModel}=${qwenPlannedMax}, ${reliableModel}=${reliableTotalPlannedMax})`,
+  );
+
+  const budgetCandidates: GroqCandidateSpec[] = [
+    {
+      role: "noreason",
+      model: qwenModel,
+      probeWithBudget: {
+        probe: qwenNoneProbe.probe,
+        probeRequestsSpent: qwenNoneProbe.probeRequestsSpent + qwenLowProbe.probeRequestsSpent,
+        rateLimitHeaders: qwenLowProbe.rateLimitHeaders,
+      },
+    },
+    {
+      role: "reliable",
+      model: reliableModel,
+      probeWithBudget: {
+        probe: reliableProbe.probe,
+        probeRequestsSpent: reliableProbe.probeRequestsSpent + GROQ_SERVICE_TIERS.length,
+        rateLimitHeaders:
+          Object.keys(tierProbeResult.latestHeaders).length > 0
+            ? tierProbeResult.latestHeaders
+            : reliableProbe.rateLimitHeaders,
+      },
+    },
+  ];
+  const plannedMap = new Map<string, number>([
+    ["noreason", qwenPlannedMax],
+    ["reliable", reliableTotalPlannedMax],
+  ]);
+  const budget = checkGroqRequestBudget(
+    groqBase.baseline.rateLimitHeaders,
+    budgetCandidates,
+    plannedMap,
+    `  Task 3d max loop requests: ${qwenModel}=${qwenPlannedMax}, ${reliableModel}=${reliableTotalPlannedMax} (total=${grandTotalPlannedMax})`,
+  );
+
+  const modelSpecs: readonly Task3dModelSpec[] = [
+    {
+      id: "qwen_none",
+      label: "qwen/qwen3.8-27b (reasoning=none)",
+      model: qwenModel,
+      probe: qwenNoneProbe.probe,
+      pacingMs: 4000,
+    },
+    {
+      id: "qwen_low",
+      label: "qwen/qwen3.8-27b (reasoning=low)",
+      model: qwenModel,
+      probe: qwenLowProbe.probe,
+      pacingMs: 4000,
+    },
+    {
+      id: "gpt_oss_120b_low",
+      label: "openai/gpt-oss-120b (reasoning=low)",
+      model: reliableModel,
+      probe: reliableProbe.probe,
+      pacingMs: 3200,
+    },
+  ];
+
+  const promptSpecs: readonly Task3dPromptSpec[] = [
+    {
+      id: "c_time",
+      label: "C-time",
+      prompt: TIME_TOOL_PROMPT_V2,
+      expectTool: "get_current_time",
+      validate: validateCurrentTimeToolCalls,
+    },
+    {
+      id: "c_order",
+      label: "C-order",
+      prompt: ORDER_TOOL_PROMPT,
+      expectTool: "get_order_status",
+      validate: validateOrderStatusToolCalls,
+    },
+    {
+      id: "plain",
+      label: "Plain",
+      prompt: PLAIN_PROMPT,
+      expectTool: null,
+    },
+    {
+      id: "near_miss_1",
+      label: "Near-miss 1",
+      prompt: NEAR_MISS_TIME_PROMPT,
+      expectTool: null,
+    },
+    {
+      id: "near_miss_2",
+      label: "Near-miss 2",
+      prompt: NEAR_MISS_SHIPPING_PROMPT,
+      expectTool: null,
+    },
+  ];
+
+  const cellBuckets = new Map<string, Task3dCellSample[]>();
+  for (const m of modelSpecs) {
+    for (const p of promptSpecs) {
+      cellBuckets.set(`${m.id}:${p.id}`, []);
+    }
+  }
+
+  const warmH2Instr = createInstrumentedAgent(true);
+  const pacer = new PerModelRatePacer();
+  const serviceTierRuns = new Map<GroqServiceTier, PlainRunSample[]>();
+  for (const tier of tiersToBenchmark) {
+    serviceTierRuns.set(tier, []);
+  }
+
+  try {
+    await listModels(GROQ_BASE_URL, cfg.groqApiKey, warmH2Instr.agent);
+
+    for (let i = 0; i < N_TASK3D; i += 1) {
+      const iterStart = performance.now();
+      for (const p of promptSpecs) {
+        for (const m of modelSpecs) {
+          await pacer.waitForModel(m.model);
+          const key = `${m.id}:${p.id}`;
+          const reasoningEffort =
+            m.probe.reasoningEffort === "not_applicable" ? undefined : m.probe.reasoningEffort;
+
+          if (p.expectTool !== null && p.validate !== undefined) {
+            const toolSample = await runToolTurn(
+              cfg.groqApiKey,
+              m.probe,
+              warmH2Instr,
+              p.prompt,
+              p.validate,
+              `3d:${key}[${i}]`,
+              "auto",
+              { systemPrompt: SYSTEM_PROMPT_V2, tools: VOICE_TOOLS_V2 },
+            );
+            const claimed = detectClaimedCheckWithoutToolCall(
+              toolSample.req1Content,
+              toolSample.calledAnyTool ? 1 : 0,
+            );
+            const wrongOrUnwanted = toolSample.calledAnyTool && !toolSample.calledExpectedTool;
+            cellBuckets.get(key)?.push({
+              correct: toolSample.passed,
+              calledAnyTool: toolSample.calledAnyTool,
+              wrongOrUnwantedToolCall: wrongOrUnwanted,
+              claimedToCheckWithoutToolCall: claimed,
+              emittedPreToolFiller: toolSample.emittedContentBeforeToolCall,
+              followupSucceeded: toolSample.passed ? toolSample.followupSucceeded : null,
+              failureReason: toolSample.reason,
+              req1Content: toolSample.req1Content,
+              req1FinishReason: toolSample.req1FinishReason,
+              req1FirstAnyTokenMs: toolSample.req1FirstAnyTokenMs,
+              req1TtftMs: toolSample.req1TtftMs,
+              tToolCallMs: toolSample.tToolCallMs,
+              followupTtftMs: toolSample.followupTtftMs,
+              e2eMs: toolSample.e2eMs,
+              req1ServerQueueMs: toolSample.req1ServerQueueMs,
+              req2ServerQueueMs: toolSample.req2ServerQueueMs,
+              groqRegion: toolSample.groqRegion,
+              cfRayLocation: toolSample.cfRayLocation,
+            });
+            pacer.recordRequests(m.model, toolSample.connectionReq2 ? 2 : 1, m.pacingMs);
+          } else {
+            const res = await runStreamingChat({
+              baseUrl: GROQ_BASE_URL,
+              apiKey: cfg.groqApiKey,
+              model: m.model,
+              systemPrompt: SYSTEM_PROMPT_V2,
+              prompt: p.prompt,
+              tools: VOICE_TOOLS_V2,
+              toolChoice: "auto",
+              reasoningEffort,
+              reasoningFormat: m.probe.reasoningFormat,
+              instr: warmH2Instr,
+            });
+            assertWarmConnection(`3d:${key}[${i}]`, res.connection);
+            const calledAnyTool = res.parsed.toolCalls.length > 0;
+            const claimed = detectClaimedCheckWithoutToolCall(
+              res.parsed.content,
+              res.parsed.toolCalls.length,
+            );
+            const failureReason = calledAnyTool
+              ? `unwanted_tool:${res.parsed.toolCalls.map((t) => t.name).join(",")}`
+              : res.parsed.content.trim().length === 0
+                ? "empty_reply"
+                : null;
+            cellBuckets.get(key)?.push({
+              correct: !calledAnyTool && res.parsed.content.trim().length > 0,
+              calledAnyTool,
+              wrongOrUnwantedToolCall: calledAnyTool,
+              claimedToCheckWithoutToolCall: claimed,
+              emittedPreToolFiller: res.parsed.emittedContentBeforeToolCall,
+              followupSucceeded: null,
+              failureReason,
+              req1Content: res.parsed.content,
+              req1FinishReason: res.parsed.finishReason,
+              req1FirstAnyTokenMs: res.firstAnyTokenMs,
+              req1TtftMs: res.ttftMs,
+              tToolCallMs: null,
+              followupTtftMs: null,
+              e2eMs: null,
+              req1ServerQueueMs: res.parsed.usage.queueTimeMs,
+              req2ServerQueueMs: null,
+              groqRegion: res.groqRegion,
+              cfRayLocation: res.cfRayLocation,
+            });
+            pacer.recordRequests(m.model, 1, m.pacingMs);
+          }
+        }
+      }
+      const elapsedSec = ((performance.now() - iterStart) / 1000).toFixed(1);
+      console.log(`[Task3d:Matrix] completed iteration ${i + 1}/${N_TASK3D} in ${elapsedSec} s`);
+    }
+
+    if (tiersToBenchmark.length > 0) {
+      const reliableEffort =
+        reliableProbe.probe.reasoningEffort === "not_applicable"
+          ? undefined
+          : reliableProbe.probe.reasoningEffort;
+      for (let i = 0; i < N_TASK3D; i += 1) {
+        for (const tier of tiersToBenchmark) {
+          await pacer.waitForModel(reliableModel);
+          const res = await runStreamingChat({
+            baseUrl: GROQ_BASE_URL,
+            apiKey: cfg.groqApiKey,
+            model: reliableModel,
+            systemPrompt: SYSTEM_PROMPT_V2,
+            prompt: PLAIN_PROMPT,
+            tools: VOICE_TOOLS_V2,
+            toolChoice: "auto",
+            reasoningEffort: reliableEffort,
+            reasoningFormat: reliableProbe.probe.reasoningFormat,
+            serviceTier: tier,
+            instr: warmH2Instr,
+          });
+          assertWarmConnection(`3d:service_tier=${tier}[${i}]`, res.connection);
+          serviceTierRuns.get(tier)?.push(toPlainRunSample(res));
+          pacer.recordRequests(reliableModel, 1, 2500);
+        }
+        console.log(`[Task3d:ServiceTier] completed iteration ${i + 1}/${N_TASK3D}`);
+      }
+    }
+  } finally {
+    await warmH2Instr.close();
+  }
+
+  console.log(
+    `\n=== Task 3d Matrix Results (prompt=${PROMPT_VERSION_V2}, toolSchema=${TOOL_SCHEMA_VERSION_V2}, tool_choice=auto, warm H2, N=${N_TASK3D}) ===`,
+  );
+  const cellSummaries: Array<ReturnType<typeof summarizeTask3dCell>> = [];
+  for (const m of modelSpecs) {
+    console.log(`\n--- ${m.label} ---`);
+    for (const p of promptSpecs) {
+      const summary = summarizeTask3dCell(m, p, cellBuckets.get(`${m.id}:${p.id}`) ?? []);
+      cellSummaries.push(summary);
+      printTask3dCellSummary(summary);
+    }
+  }
+
+  // Part 3a: queue_time min/median/p90/max for openai/gpt-oss-120b runs.
+  const reliablePlainQueueTimes = (cellBuckets.get("gpt_oss_120b_low:plain") ?? [])
+    .map((r) => r.req1ServerQueueMs)
+    .filter((v): v is number => v !== null);
+  const reliableAllReq1QueueTimes = promptSpecs
+    .flatMap((p) => cellBuckets.get(`gpt_oss_120b_low:${p.id}`) ?? [])
+    .map((r) => r.req1ServerQueueMs)
+    .filter((v): v is number => v !== null);
+  const reliableAllReqQueueTimes = promptSpecs
+    .flatMap((p) => cellBuckets.get(`gpt_oss_120b_low:${p.id}`) ?? [])
+    .flatMap((r) => [r.req1ServerQueueMs, r.req2ServerQueueMs])
+    .filter((v): v is number => v !== null);
+
+  const queueStatsPlain = summarize(reliablePlainQueueTimes);
+  const queueStatsAllReq1 = summarize(reliableAllReq1QueueTimes);
+  const queueStatsAllReqs = summarize(reliableAllReqQueueTimes);
+
+  console.log(`\n=== Task 3d Part 3a: ${reliableModel} queue_time distribution ===`);
+  for (const [label, q] of [
+    ["Matrix Plain (n=10)", queueStatsPlain],
+    ["Matrix All req1 (5 prompts x 10)", queueStatsAllReq1],
+    ["Matrix All requests (req1 + req2)", queueStatsAllReqs],
+  ] as const) {
+    console.log(
+      `  ${label} (count=${q.count}): min=${formatMs(q.min)} | median=${formatMs(q.median)} | p90=${formatMs(q.p90)} | max=${formatMs(q.max)}`,
+    );
+  }
+
+  console.log(`\n=== Task 3d Part 3b: ${reliableModel} service_tier Plain Warm H2 (N=${N_TASK3D}/tier) ===`);
+  if (tiersToBenchmark.length === 0) {
+    console.log(
+      "  Skipped extra service_tier loop: Groq free tier only accepts default service_tier=\"on_demand\" (auto, flex, performance returned HTTP 400).",
+    );
+  }
+  const serviceTierSummaries = tiersToBenchmark.map((tier) => {
+    const s = summarizePlainRuns(serviceTierRuns.get(tier) ?? []);
+    console.log(
+      `  service_tier="${tier}" (n=${s.n}): ` +
+        `queue_time min=${formatMs(s.serverTimings.queueTimeMs.min)} med=${formatMs(s.serverTimings.queueTimeMs.median)} p90=${formatMs(s.serverTimings.queueTimeMs.p90)} max=${formatMs(s.serverTimings.queueTimeMs.max)} | ` +
+        `TTFT(content) med=${formatMs(s.ttftMs.median)} p90=${formatMs(s.ttftMs.p90)} | ` +
+        `FirstToken(any) med=${formatMs(s.firstAnyTokenMs.median)} p90=${formatMs(s.firstAnyTokenMs.p90)}`,
+    );
+    return {
+      tier,
+      summary: s,
+    };
+  });
+
+  mkdirSync(OUT_DIR, { recursive: true });
+  const payload = {
+    timestamp: new Date().toISOString(),
+    nodeVersion: process.version,
+    promptVersion: PROMPT_VERSION_V2,
+    toolSchemaVersion: TOOL_SCHEMA_VERSION_V2,
+    comparisonBaseline: {
+      promptVersion: PROMPT_VERSION,
+      toolSchemaVersion: TOOL_SCHEMA_VERSION_V1,
+    },
+    systemPrompt: SYSTEM_PROMPT_V2,
+    tools: VOICE_TOOLS_V2,
+    nTask3d: N_TASK3D,
+    plannedRequestCounts: {
+      qwenPlannedMax,
+      reliableMatrixPlannedMax,
+      serviceTierPlannedReqs,
+      reliableTotalPlannedMax,
+      grandTotalPlannedMax,
+    },
+    budget,
+    baselines: {
+      groqControlPlane: groqBase.baseline,
+    },
+    matrixCells: cellSummaries,
+    queueTime120b: {
+      matrixPlain: queueStatsPlain,
+      matrixAllReq1: queueStatsAllReq1,
+      matrixAllRequests: queueStatsAllReqs,
+    },
+    serviceTierCheck: {
+      probes: tierProbeResult.probes,
+      allowedTiers,
+      results: serviceTierSummaries,
+    },
+  };
+  writeFileSync(TASK3D_RESULTS_PATH, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  console.log(`\nSaved Task 3d results to ${TASK3D_RESULTS_PATH}`);
+}
+
 async function main(): Promise<void> {
   if (process.argv.includes("--list-models")) {
     await printAvailableModels();
@@ -2223,6 +2890,10 @@ async function main(): Promise<void> {
   }
   if (process.argv.includes("--task3c")) {
     await runTask3cDiagnosis();
+    return;
+  }
+  if (process.argv.includes("--task3d")) {
+    await runTask3dExperiment();
     return;
   }
 
@@ -2323,6 +2994,7 @@ async function main(): Promise<void> {
     timestamp: new Date().toISOString(),
     nodeVersion: process.version,
     promptVersion: PROMPT_VERSION,
+    toolSchemaVersion: TOOL_SCHEMA_VERSION_V1,
     systemPrompt: SYSTEM_PROMPT,
     sampleSizeN: N_RUNS,
     interleavedRoundRobin: true,

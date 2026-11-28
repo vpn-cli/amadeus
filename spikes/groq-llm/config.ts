@@ -3,18 +3,40 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 
-export const PROMPT_VERSION = "voice-v1" as const;
+export const PROMPT_VERSION_V1 = "voice-v1" as const;
+export const PROMPT_VERSION_V2 = "voice-v2" as const;
+export const PROMPT_VERSION = PROMPT_VERSION_V1;
 
-export const SYSTEM_PROMPT =
+export const TOOL_SCHEMA_VERSION_V1 = "tools-v1" as const;
+export const TOOL_SCHEMA_VERSION_V2 = "tools-v2" as const;
+export const TOOL_SCHEMA_VERSION = TOOL_SCHEMA_VERSION_V1;
+
+export type PromptVersion = typeof PROMPT_VERSION_V1 | typeof PROMPT_VERSION_V2;
+export type ToolSchemaVersion = typeof TOOL_SCHEMA_VERSION_V1 | typeof TOOL_SCHEMA_VERSION_V2;
+
+export const SYSTEM_PROMPT_V1 =
   "You are a concise voice support assistant. Reply in one or two short natural spoken sentences using plain text only, with no markdown, symbols, or lists.";
+
+export const SYSTEM_PROMPT_V2 =
+  `${SYSTEM_PROMPT_V1} You can use tools. When the user asks for the time or date, or about an order, call the matching tool immediately. Never ask for a timezone; the time tool defaults to the user's local timezone. Never say you are checking something unless you call the tool in the same reply.`;
+
+export const SYSTEM_PROMPT = SYSTEM_PROMPT_V1;
 
 export const PLAIN_PROMPT =
   "Explain in two short sentences why the sky looks blue during the day.";
 
 export const TIME_TOOL_PROMPT = "What time is it?";
 
+export const TIME_TOOL_PROMPT_V2 = "Thanks, what time is it right now?";
+
 export const ORDER_TOOL_PROMPT =
   "Can you check the status of my order number one zero four two?";
+
+export const NEAR_MISS_TIME_PROMPT =
+  "What's a good time of day to call customer support?";
+
+export const NEAR_MISS_SHIPPING_PROMPT =
+  "How long does shipping usually take?";
 
 export const TOOL_PROMPT = ORDER_TOOL_PROMPT;
 
@@ -37,7 +59,7 @@ export interface OpenAiToolDefinition {
   };
 }
 
-export const VOICE_TOOLS: readonly OpenAiToolDefinition[] = [
+export const VOICE_TOOLS_V1: readonly OpenAiToolDefinition[] = [
   {
     type: "function",
     function: {
@@ -74,6 +96,46 @@ export const VOICE_TOOLS: readonly OpenAiToolDefinition[] = [
     },
   },
 ];
+
+export const VOICE_TOOLS_V2: readonly OpenAiToolDefinition[] = [
+  VOICE_TOOLS_V1[0]!,
+  {
+    type: "function",
+    function: {
+      name: "get_current_time",
+      description:
+        "Call whenever the user asks for the current time or date. timezone is optional; omit it to use the user's local timezone (Asia/Kolkata).",
+      parameters: VOICE_TOOLS_V1[1]!.function.parameters,
+    },
+  },
+];
+
+export const VOICE_TOOLS = VOICE_TOOLS_V1;
+
+export interface PromptProfile {
+  readonly promptVersion: PromptVersion;
+  readonly toolSchemaVersion: ToolSchemaVersion;
+  readonly systemPrompt: string;
+  readonly tools: readonly OpenAiToolDefinition[];
+}
+
+export const PROMPT_PROFILES: Readonly<Record<PromptVersion, PromptProfile>> = {
+  "voice-v1": {
+    promptVersion: PROMPT_VERSION_V1,
+    toolSchemaVersion: TOOL_SCHEMA_VERSION_V1,
+    systemPrompt: SYSTEM_PROMPT_V1,
+    tools: VOICE_TOOLS_V1,
+  },
+  "voice-v2": {
+    promptVersion: PROMPT_VERSION_V2,
+    toolSchemaVersion: TOOL_SCHEMA_VERSION_V2,
+    systemPrompt: SYSTEM_PROMPT_V2,
+    tools: VOICE_TOOLS_V2,
+  },
+};
+
+export const GROQ_SERVICE_TIERS = ["on_demand", "auto", "flex", "performance"] as const;
+export type GroqServiceTier = (typeof GROQ_SERVICE_TIERS)[number];
 
 export const ReasoningEffortSchema = z.enum(["none", "minimal", "low", "medium", "high"]);
 export type ReasoningEffort = z.infer<typeof ReasoningEffortSchema>;
