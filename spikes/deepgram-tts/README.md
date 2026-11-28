@@ -125,4 +125,4 @@ pnpm --dir spikes/deepgram-tts live -- --spoken-id-check             # 109 chars
      - Flushing **only sentence 1 immediately** (for minimal `tts_first_audio`) and **once at LLM stream end** uses **1–2 Flushes per turn** (`10–20` turns/min on one socket), staying safely below `20 Flushes / 60 s` while keeping `J = 60–100 ms` client jitter buffering at `0/60` underruns.
 
 5. **Spoken-form normalization for IDs vs captions:**
-   - Captions keep the original text; TTS receives a spoken form. A deterministic normalizer rewrites known IDs (values from tool calls, e.g. `order_id`) and `'order/#' + digits` into spoken digits before TTS. Barge-in `played_ms` → heard-text mapping must use the spoken text and map back to caption text.
+   - Captions keep the original text; TTS receives a spoken form. A deterministic normalizer rewrites known IDs (values from tool calls, e.g. `order_id`) and `'order/#' + digits` as space-separated digits (`"1042"` → `"1 0 4 2"`) before TTS — chosen by listening test over `"one zero four two"` and `"ten forty-two"`. Barge-in `played_ms` → heard-text mapping must use the spoken text and map back to caption text.
