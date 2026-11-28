@@ -55,8 +55,39 @@ describe("GroqStreamAccumulator", () => {
       completionTokens: 8,
       totalTokens: 20,
       reasoningTokens: 5,
+      queueTimeMs: null,
+      promptTimeMs: null,
+      completionTimeMs: null,
+      totalTimeMs: null,
     });
     expect(res.emittedContentBeforeToolCall).toBe(false);
+  });
+
+  it("extracts Groq server-side queue/prompt/completion/total timings in milliseconds", () => {
+    const acc = new GroqStreamAccumulator();
+    acc.pushEventData(
+      JSON.stringify({
+        choices: [{ delta: { content: "Hi." }, finish_reason: "stop" }],
+        x_groq: {
+          id: "req_123",
+          usage: {
+            queue_time: 0.042,
+            prompt_tokens: 50,
+            prompt_time: 0.0085,
+            completion_tokens: 10,
+            completion_time: 0.0195,
+            total_tokens: 60,
+            total_time: 0.028,
+          },
+        },
+      }),
+    );
+    acc.pushEventData("[DONE]");
+    const res = acc.result();
+    expect(res.usage.queueTimeMs).toBeCloseTo(42, 6);
+    expect(res.usage.promptTimeMs).toBeCloseTo(8.5, 6);
+    expect(res.usage.completionTimeMs).toBeCloseTo(19.5, 6);
+    expect(res.usage.totalTimeMs).toBeCloseTo(28, 6);
   });
 
   it("assembles fragmented tool calls by index and detects pre-tool filler content", () => {

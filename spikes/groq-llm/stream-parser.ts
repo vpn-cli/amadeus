@@ -14,6 +14,19 @@ export interface RawToolCallDelta {
   };
 }
 
+export interface RawStreamUsage {
+  readonly queue_time?: number;
+  readonly prompt_time?: number;
+  readonly completion_time?: number;
+  readonly total_time?: number;
+  readonly prompt_tokens?: number;
+  readonly completion_tokens?: number;
+  readonly total_tokens?: number;
+  readonly completion_tokens_details?: {
+    readonly reasoning_tokens?: number;
+  };
+}
+
 export interface RawChatCompletionChunk {
   readonly id?: string;
   readonly model?: string;
@@ -28,23 +41,10 @@ export interface RawChatCompletionChunk {
       readonly tool_calls?: ReadonlyArray<RawToolCallDelta>;
     };
   }>;
-  readonly usage?: {
-    readonly prompt_tokens?: number;
-    readonly completion_tokens?: number;
-    readonly total_tokens?: number;
-    readonly completion_tokens_details?: {
-      readonly reasoning_tokens?: number;
-    };
-  };
+  readonly usage?: RawStreamUsage;
   readonly x_groq?: {
-    readonly usage?: {
-      readonly prompt_tokens?: number;
-      readonly completion_tokens?: number;
-      readonly total_tokens?: number;
-      readonly completion_tokens_details?: {
-        readonly reasoning_tokens?: number;
-      };
-    };
+    readonly id?: string;
+    readonly usage?: RawStreamUsage;
   };
 }
 
@@ -63,6 +63,14 @@ export interface StreamUsage {
   readonly completionTokens: number | null;
   readonly totalTokens: number | null;
   readonly reasoningTokens: number | null;
+  readonly queueTimeMs: number | null;
+  readonly promptTimeMs: number | null;
+  readonly completionTimeMs: number | null;
+  readonly totalTimeMs: number | null;
+}
+
+function secondsToMs(value: number | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value * 1000 : null;
 }
 
 export interface StreamDeltaStep {
@@ -119,6 +127,10 @@ export class GroqStreamAccumulator {
     completionTokens: null,
     totalTokens: null,
     reasoningTokens: null,
+    queueTimeMs: null,
+    promptTimeMs: null,
+    completionTimeMs: null,
+    totalTimeMs: null,
   };
   private seenNonEmptyContent = false;
   private seenToolCall = false;
@@ -151,6 +163,10 @@ export class GroqStreamAccumulator {
         totalTokens: usageSource.total_tokens ?? this.usage.totalTokens,
         reasoningTokens:
           usageSource.completion_tokens_details?.reasoning_tokens ?? this.usage.reasoningTokens,
+        queueTimeMs: secondsToMs(usageSource.queue_time) ?? this.usage.queueTimeMs,
+        promptTimeMs: secondsToMs(usageSource.prompt_time) ?? this.usage.promptTimeMs,
+        completionTimeMs: secondsToMs(usageSource.completion_time) ?? this.usage.completionTimeMs,
+        totalTimeMs: secondsToMs(usageSource.total_time) ?? this.usage.totalTimeMs,
       };
     }
 

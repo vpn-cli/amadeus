@@ -37,12 +37,14 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "../..");
 const OUT_DIR = path.join(__dirname, "out");
 const RESULTS_PATH = path.join(OUT_DIR, "results.json");
+const TASK3C_RESULTS_PATH = path.join(OUT_DIR, "task3c-results.json");
 
 const GROQ_BASE_URL = "https://api.groq.com/openai/v1";
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai";
 
 const N_BASELINE = 10;
 const N_RUNS = 20;
+const N_TASK3C = 10;
 const GROQ_REQUESTS_PER_ITERATION = 11; // A(1) + B(1) + B-h2(1) + C-time(2) + C-order(2) + D-h1(2) + D-h2(2)
 const GROQ_PACING_MS = 2400; // <= 25 RPM per model (free tier: 30 RPM, 8,000 TPM)
 const GEMINI_PACING_MS = 4100;
@@ -151,14 +153,24 @@ interface RequestBudgetEntry {
 
 interface PlainRunSample {
   readonly ttftMs: number | null;
+  readonly firstAnyTokenMs: number | null;
   readonly firstSentenceAbsMs: number | null;
   readonly firstSentenceRelMs: number | null;
   readonly totalMs: number;
   readonly reasoningTokens: number;
   readonly wronglyCalledTool: boolean;
+  readonly serverQueueMs: number | null;
+  readonly serverPromptMs: number | null;
+  readonly serverCompletionMs: number | null;
+  readonly serverPreFirstTokenMs: number | null;
+  readonly serverPreContentEstMs: number | null;
+  readonly networkFirstTokenMs: number | null;
+  readonly networkContentTtftMs: number | null;
   readonly connection: RequestConnectionMetrics;
   readonly protocol: HttpProtocol;
   readonly cfRayLocation: string | null;
+  readonly groqRegion: string | null;
+  readonly serverTimingHeader: string | null;
   readonly rateLimitHeaders: Record<string, string>;
 }
 
@@ -172,6 +184,10 @@ interface ToolRunSample {
   readonly reason: string | null;
   readonly emittedContentBeforeToolCall: boolean;
   readonly preToolContentTtftMs: number | null;
+  readonly req1TtftMs: number | null;
+  readonly req1FirstAnyTokenMs: number | null;
+  readonly req1Content: string;
+  readonly req1FinishReason: string | null;
   readonly tToolCallMs: number | null;
   readonly tExecMs: number | null;
   readonly followupTtftMs: number | null;
@@ -185,6 +201,7 @@ interface ToolRunSample {
   readonly connectionReq2: RequestConnectionMetrics | null;
   readonly protocol: HttpProtocol;
   readonly cfRayLocation: string | null;
+  readonly groqRegion: string | null;
   readonly rateLimitHeaders: Record<string, string>;
 }
 
@@ -338,6 +355,11 @@ function extractCfRayLocation(headers: Response["headers"]): string | null {
   return dashIdx >= 0 ? cfRay.slice(dashIdx) : cfRay;
 }
 
+function extractGroqRegion(headers: Response["headers"]): string | null {
+  const region = headers.get("x-groq-region");
+  return region && region.trim().length > 0 ? region.trim() : null;
+}
+
 function extractRateLimitHeaders(headers: Response["headers"]): Record<string, string> {
   const out: Record<string, string> = {};
   headers.forEach((value, key) => {
@@ -468,13 +490,15 @@ async function measureBaseline(
     console.log(
       `[Baseline:${label}] host=${host} edge=${edgeLocation ?? "none"} proto=${baseline.protocol} ` +
         `edgeRTT(med=${formatMs(baseline.edgeRttMs.median)}, p90=${formatMs(baseline.edgeRttMs.p90)}) ` +
-        `originRTT(med=${formatMs(baseline.originRttMs.median)}, p90=${formatMs(baseline.originRttMs.p90)})`,
+        `/models control-plane RTT (not the inference path)(med=${formatMs(baseline.originRttMs.median)}, p90=${formatMs(baseline.originRttMs.p90)})`,
     );
     return { baseline, modelIds: warmup.modelIds };
   } finally {
     await instr.close();
   }
 }
+
+type ToolChoiceOption = "auto" | "required" | "none";
 
 interface ChatRequestOptions {
   readonly baseUrl: string;
@@ -483,7 +507,8 @@ interface ChatRequestOptions {
   readonly prompt?: string;
   readonly messages?: readonly ChatMessage[];
   readonly tools: typeof VOICE_TOOLS | undefined;
-  readonly reasoningEffort?: ReasoningEffort | undefined;
+  readonly toolChoice?: ToolChoiceOption;
+  readonly reasoningEffort?: ReasoningEffort | "default" | undefined;
   readonly reasoningFormat?: "parsed" | "default" | undefined;
   readonly instr: InstrumentedAgent;
   readonly maxTokens?: number;
@@ -494,15 +519,19 @@ interface ChatStreamOutcome {
   readonly parsed: ParsedStreamResult;
   readonly startTimestampMs: number;
   readonly firstContentTimestampMs: number | null;
+  readonly firstAnyTokenMs: number | null;
   readonly ttftMs: number | null;
   readonly toolCallAssembledMs: number | null;
   readonly firstSentenceAbsMs: number | null;
   readonly firstSentenceRelMs: number | null;
   readonly totalMs: number;
+  readonly rateLimitWaitMs: number;
   readonly deltasAfterAbort: number;
   readonly aborted: boolean;
   readonly connection: RequestConnectionMetrics;
   readonly cfRayLocation: string | null;
+  readonly groqRegion: string | null;
+  readonly serverTimingHeader: string | null;
   readonly rateLimitHeaders: Record<string, string>;
 }
 
@@ -556,8 +585,12 @@ function assertWarmConnection(label: string, conn: RequestConnectionMetrics): vo
   }
 }
 
-async function runStreamingChat(opts: ChatRequestOptions): Promise<ChatStreamOutcome> {
-  const controller = new AbortController();
+function buildChatRequestBody(
+  opts: Pick<
+    ChatRequestOptions,
+    "model" | "prompt" | "messages" | "tools" | "toolChoice" | "reasoningEffort" | "reasoningFormat" | "maxTokens"
+  >,
+): Record<string, unknown> {
   const messages: readonly ChatMessage[] =
     opts.messages ?? [
       { role: "system", content: SYSTEM_PROMPT },
@@ -573,6 +606,7 @@ async function runStreamingChat(opts: ChatRequestOptions): Promise<ChatStreamOut
   };
   if (opts.tools !== undefined) {
     bodyObj.tools = opts.tools;
+    bodyObj.tool_choice = opts.toolChoice ?? "auto";
   }
   if (opts.reasoningEffort !== undefined) {
     bodyObj.reasoning_effort = opts.reasoningEffort;
@@ -580,9 +614,16 @@ async function runStreamingChat(opts: ChatRequestOptions): Promise<ChatStreamOut
   if (opts.reasoningFormat === "parsed") {
     bodyObj.reasoning_format = "parsed";
   }
+  return bodyObj;
+}
+
+async function runStreamingChat(opts: ChatRequestOptions): Promise<ChatStreamOutcome> {
+  const controller = new AbortController();
+  const bodyObj = buildChatRequestBody(opts);
 
   let res: Response | null = null;
   let tStart = 0;
+  let rateLimitWaitMs = 0;
   let connectEventsStartIdx = 0;
   for (let attempt = 0; attempt <= MAX_RATE_LIMIT_RETRIES; attempt += 1) {
     connectEventsStartIdx = opts.instr.getConnectEventsCount();
@@ -608,6 +649,7 @@ async function runStreamingChat(opts: ChatRequestOptions): Promise<ChatStreamOut
       );
     }
     const waitMs = computeRateLimitWaitMs(res, errText);
+    rateLimitWaitMs += waitMs;
     console.warn(
       `[RateLimit] 429 on ${opts.model} (attempt ${attempt + 1}/${MAX_RATE_LIMIT_RETRIES}), waiting ${waitMs} ms`,
     );
@@ -628,6 +670,8 @@ async function runStreamingChat(opts: ChatRequestOptions): Promise<ChatStreamOut
   }
 
   const cfRayLocation = extractCfRayLocation(res.headers);
+  const groqRegion = extractGroqRegion(res.headers);
+  const serverTimingHeader = res.headers.get("server-timing");
   const rateLimitHeaders = extractRateLimitHeaders(res.headers);
 
   const sse = new SseParser();
@@ -635,6 +679,7 @@ async function runStreamingChat(opts: ChatRequestOptions): Promise<ChatStreamOut
   const splitter = new SentenceSplitter();
 
   let firstContentTimestampMs: number | null = null;
+  let firstAnyTokenMs: number | null = null;
   let ttftMs: number | null = null;
   let toolCallAssembledMs: number | null = null;
   let lastToolDeltaTimestampMs: number | null = null;
@@ -656,6 +701,12 @@ async function runStreamingChat(opts: ChatRequestOptions): Promise<ChatStreamOut
         }
         const step = acc.pushEventData(evt.data);
         if (step.done) continue;
+        if (
+          firstAnyTokenMs === null &&
+          (step.reasoningDelta.length > 0 || step.isFirstContentDelta || step.hasToolCallDelta)
+        ) {
+          firstAnyTokenMs = now - tStart;
+        }
         if (step.hasToolCallDelta) {
           lastToolDeltaTimestampMs = now;
         }
@@ -694,6 +745,12 @@ async function runStreamingChat(opts: ChatRequestOptions): Promise<ChatStreamOut
       for (const evt of sse.flush()) {
         const step = acc.pushEventData(evt.data);
         if (step.done) continue;
+        if (
+          firstAnyTokenMs === null &&
+          (step.reasoningDelta.length > 0 || step.isFirstContentDelta || step.hasToolCallDelta)
+        ) {
+          firstAnyTokenMs = flushNow - tStart;
+        }
         if (step.hasToolCallDelta) {
           lastToolDeltaTimestampMs = flushNow;
         }
@@ -736,15 +793,19 @@ async function runStreamingChat(opts: ChatRequestOptions): Promise<ChatStreamOut
     parsed,
     startTimestampMs: tStart,
     firstContentTimestampMs,
+    firstAnyTokenMs,
     ttftMs,
     toolCallAssembledMs,
     firstSentenceAbsMs,
     firstSentenceRelMs,
     totalMs,
+    rateLimitWaitMs,
     deltasAfterAbort,
     aborted: abortedAtMs !== null,
     connection,
     cfRayLocation,
+    groqRegion,
+    serverTimingHeader,
     rateLimitHeaders,
   };
 }
@@ -953,29 +1014,65 @@ function summarizeConnectionMetrics(conns: readonly RequestConnectionMetrics[]) 
 
 function summarizePlainRuns(runs: readonly PlainRunSample[]) {
   const ttfts = runs.map((r) => r.ttftMs).filter((v): v is number => v !== null);
+  const firstAnyTokens = runs.map((r) => r.firstAnyTokenMs).filter((v): v is number => v !== null);
   const absFirst = runs.map((r) => r.firstSentenceAbsMs).filter((v): v is number => v !== null);
   const relFirst = runs.map((r) => r.firstSentenceRelMs).filter((v): v is number => v !== null);
   const totals = runs.map((r) => r.totalMs);
   const reasoning = runs.map((r) => r.reasoningTokens);
+  const serverQueues = runs.map((r) => r.serverQueueMs).filter((v): v is number => v !== null);
+  const serverPrompts = runs.map((r) => r.serverPromptMs).filter((v): v is number => v !== null);
+  const serverCompletions = runs.map((r) => r.serverCompletionMs).filter((v): v is number => v !== null);
+  const serverPreFirstTokens = runs
+    .map((r) => r.serverPreFirstTokenMs)
+    .filter((v): v is number => v !== null);
+  const serverPreContentEsts = runs
+    .map((r) => r.serverPreContentEstMs)
+    .filter((v): v is number => v !== null);
+  const networkFirstTokens = runs
+    .map((r) => r.networkFirstTokenMs)
+    .filter((v): v is number => v !== null);
+  const networkContentTtfts = runs
+    .map((r) => r.networkContentTtftMs)
+    .filter((v): v is number => v !== null);
   const wrongToolCalls = runs.filter((r) => r.wronglyCalledTool).length;
   const protocols = [...new Set(runs.map((r) => r.protocol))];
   const edgeLocations = [
     ...new Set(runs.map((r) => r.cfRayLocation).filter((v): v is string => v !== null)),
+  ];
+  const groqRegions = [
+    ...new Set(runs.map((r) => r.groqRegion).filter((v): v is string => v !== null)),
+  ];
+  const serverTimingHeaders = [
+    ...new Set(runs.map((r) => r.serverTimingHeader).filter((v): v is string => v !== null)),
   ];
   const rateLimits = Object.assign({}, ...runs.map((r) => r.rateLimitHeaders));
 
   return {
     n: runs.length,
     ttftMs: summarize(ttfts),
+    firstAnyTokenMs: summarize(firstAnyTokens),
     firstSentenceAbsMs: summarize(absFirst),
     firstSentenceRelMs: summarize(relFirst),
     totalMs: summarize(totals),
     reasoningTokens: summarize(reasoning),
+    serverTimings: {
+      available: serverPreFirstTokens.length > 0,
+      sampleCount: serverPreFirstTokens.length,
+      queueTimeMs: summarize(serverQueues),
+      promptTimeMs: summarize(serverPrompts),
+      completionTimeMs: summarize(serverCompletions),
+      serverPreFirstTokenMs: summarize(serverPreFirstTokens),
+      serverPreContentEstMs: summarize(serverPreContentEsts),
+      networkFirstTokenMs: summarize(networkFirstTokens),
+      networkContentTtftMs: summarize(networkContentTtfts),
+    },
     wrongToolCalls,
     wrongToolCallRate: formatPct(wrongToolCalls, runs.length),
     connection: summarizeConnectionMetrics(runs.map((r) => r.connection)),
     protocols,
     edgeLocations,
+    groqRegions,
+    serverTimingHeaders,
     rateLimitHeaders: rateLimits,
   };
 }
@@ -992,6 +1089,10 @@ function summarizeToolRuns(
     .map((r) => r.preToolContentTtftMs)
     .filter((v): v is number => v !== null);
   const followupSuccessCount = runs.filter((r) => r.followupSucceeded).length;
+  const req1Ttfts = runs.map((r) => r.req1TtftMs).filter((v): v is number => v !== null);
+  const req1FirstAnyTokens = runs
+    .map((r) => r.req1FirstAnyTokenMs)
+    .filter((v): v is number => v !== null);
   const tToolCalls = runs.map((r) => r.tToolCallMs).filter((v): v is number => v !== null);
   const tExecs = runs.map((r) => r.tExecMs).filter((v): v is number => v !== null);
   const followupTtfts = runs.map((r) => r.followupTtftMs).filter((v): v is number => v !== null);
@@ -1002,6 +1103,9 @@ function summarizeToolRuns(
   const protocols = [...new Set(runs.map((r) => r.protocol))];
   const edgeLocations = [
     ...new Set(runs.map((r) => r.cfRayLocation).filter((v): v is string => v !== null)),
+  ];
+  const groqRegions = [
+    ...new Set(runs.map((r) => r.groqRegion).filter((v): v is string => v !== null)),
   ];
   const rateLimits = Object.assign({}, ...runs.map((r) => r.rateLimitHeaders));
   const req2Conns = runs
@@ -1020,6 +1124,8 @@ function summarizeToolRuns(
     fillerCount: fillerRuns.length,
     fillerRate: formatPct(fillerRuns.length, runs.length),
     preToolContentTtftMs: summarize(fillerTtfts),
+    req1TtftMs: summarize(req1Ttfts),
+    req1FirstAnyTokenMs: summarize(req1FirstAnyTokens),
     tToolCallMs: summarize(tToolCalls),
     tExecMs: summarize(tExecs),
     followupTtftMs: summarize(followupTtfts),
@@ -1031,8 +1137,17 @@ function summarizeToolRuns(
     connectionReq2: summarizeConnectionMetrics(req2Conns),
     protocols,
     edgeLocations,
+    groqRegions,
     rateLimitHeaders: rateLimits,
     failureReasons: runs.filter((r) => !r.passed).map((r) => r.reason),
+    plainTextSamples: runs
+      .filter((r) => !r.calledAnyTool && r.req1Content.length > 0)
+      .slice(0, 3)
+      .map((r) => ({
+        content: r.req1Content,
+        finishReason: r.req1FinishReason,
+        ttftMs: r.req1TtftMs,
+      })),
   };
 }
 
@@ -1076,6 +1191,7 @@ async function runToolTurn(
   prompt: string,
   validate: (toolCalls: readonly AssembledToolCall[]) => ToolValidationResult,
   label: string,
+  toolChoiceReq1: ToolChoiceOption = "auto",
 ): Promise<ToolRunSample> {
   const reasoningEffort =
     probe.reasoningEffort === "not_applicable" ? undefined : probe.reasoningEffort;
@@ -1086,6 +1202,7 @@ async function runToolTurn(
     model: probe.model,
     prompt,
     tools: VOICE_TOOLS,
+    toolChoice: toolChoiceReq1,
     reasoningEffort,
     reasoningFormat: probe.reasoningFormat,
     instr: warmInstr,
@@ -1102,6 +1219,7 @@ async function runToolTurn(
   let reasoningTokensReq2 = 0;
   let totalMs = req1.totalMs;
   let cfRayLocation = req1.cfRayLocation;
+  let groqRegion = req1.groqRegion;
   let rateLimitHeaders = req1.rateLimitHeaders;
 
   if (validation.passed && req1.parsed.toolCalls.length > 0) {
@@ -1142,6 +1260,7 @@ async function runToolTurn(
       model: probe.model,
       messages: followupMessages,
       tools: VOICE_TOOLS,
+      toolChoice: "auto",
       reasoningEffort,
       reasoningFormat: probe.reasoningFormat,
       instr: warmInstr,
@@ -1154,11 +1273,12 @@ async function runToolTurn(
     followupSucceeded = req2.ttftMs !== null && req2.parsed.toolCalls.length === 0;
     e2eMs =
       req2.firstContentTimestampMs !== null
-        ? req2.firstContentTimestampMs - req1.startTimestampMs
+        ? req2.firstContentTimestampMs - req1.startTimestampMs - req2.rateLimitWaitMs
         : null;
     reasoningTokensReq2 = req2.parsed.usage.reasoningTokens ?? 0;
     totalMs = req1.totalMs + execAccum + req2.totalMs;
     if (req2.cfRayLocation) cfRayLocation = req2.cfRayLocation;
+    if (req2.groqRegion) groqRegion = req2.groqRegion;
     rateLimitHeaders = { ...rateLimitHeaders, ...req2.rateLimitHeaders };
   }
 
@@ -1166,6 +1286,10 @@ async function runToolTurn(
     ...validation,
     emittedContentBeforeToolCall: req1.parsed.emittedContentBeforeToolCall,
     preToolContentTtftMs: req1.parsed.emittedContentBeforeToolCall ? req1.ttftMs : null,
+    req1TtftMs: req1.ttftMs,
+    req1FirstAnyTokenMs: req1.firstAnyTokenMs,
+    req1Content: req1.parsed.content,
+    req1FinishReason: req1.parsed.finishReason,
     tToolCallMs: req1.toolCallAssembledMs,
     tExecMs,
     followupTtftMs,
@@ -1179,21 +1303,54 @@ async function runToolTurn(
     connectionReq2: req2Connection,
     protocol: req1.connection.protocol,
     cfRayLocation,
+    groqRegion,
     rateLimitHeaders,
   };
 }
 
 function toPlainRunSample(res: ChatStreamOutcome): PlainRunSample {
+  const queueMs = res.parsed.usage.queueTimeMs;
+  const promptMs = res.parsed.usage.promptTimeMs;
+  const completionMs = res.parsed.usage.completionTimeMs;
+  const reasoningTokens = res.parsed.usage.reasoningTokens ?? 0;
+  const completionTokens = res.parsed.usage.completionTokens ?? 0;
+  const serverPreFirstTokenMs =
+    queueMs !== null && promptMs !== null ? queueMs + promptMs : null;
+  const reasoningEstMs =
+    reasoningTokens > 0 && completionTokens > 0 && completionMs !== null
+      ? completionMs * (reasoningTokens / completionTokens)
+      : 0;
+  const serverPreContentEstMs =
+    serverPreFirstTokenMs !== null ? serverPreFirstTokenMs + reasoningEstMs : null;
+  const networkFirstTokenMs =
+    res.firstAnyTokenMs !== null && serverPreFirstTokenMs !== null
+      ? res.firstAnyTokenMs - serverPreFirstTokenMs
+      : null;
+  const networkContentTtftMs =
+    res.ttftMs !== null && serverPreContentEstMs !== null
+      ? res.ttftMs - serverPreContentEstMs
+      : null;
+
   return {
     ttftMs: res.ttftMs,
+    firstAnyTokenMs: res.firstAnyTokenMs,
     firstSentenceAbsMs: res.firstSentenceAbsMs,
     firstSentenceRelMs: res.firstSentenceRelMs,
     totalMs: res.totalMs,
-    reasoningTokens: res.parsed.usage.reasoningTokens ?? 0,
+    reasoningTokens,
     wronglyCalledTool: res.parsed.toolCalls.length > 0,
+    serverQueueMs: queueMs,
+    serverPromptMs: promptMs,
+    serverCompletionMs: completionMs,
+    serverPreFirstTokenMs,
+    serverPreContentEstMs,
+    networkFirstTokenMs,
+    networkContentTtftMs,
     connection: res.connection,
     protocol: res.connection.protocol,
     cfRayLocation: res.cfRayLocation,
+    groqRegion: res.groqRegion,
+    serverTimingHeader: res.serverTimingHeader,
     rateLimitHeaders: res.rateLimitHeaders,
   };
 }
@@ -1282,7 +1439,6 @@ interface ModelBuckets {
 function buildGroqModelReport(
   probe: ModelProbeResult,
   buckets: ModelBuckets,
-  originRttMedianMs: number | null,
 ) {
   const coldSummary = summarizePlainRuns(buckets.coldRuns);
   const warmSummary = summarizePlainRuns(buckets.warmH1Runs);
@@ -1312,17 +1468,6 @@ function buildGroqModelReport(
 
   return {
     settings: probe,
-    estimatedModelTimeMs: {
-      h1Ms:
-        warmSummary.ttftMs.median !== null && originRttMedianMs !== null
-          ? warmSummary.ttftMs.median - originRttMedianMs
-          : null,
-      h2Ms:
-        warmH2Summary.ttftMs.median !== null && originRttMedianMs !== null
-          ? warmH2Summary.ttftMs.median - originRttMedianMs
-          : null,
-      originRttMedianMs,
-    },
     scenarioA_cold: coldSummary,
     scenarioB_warm: warmSummary,
     scenarioB_warmH2: warmH2Summary,
@@ -1336,7 +1481,6 @@ function buildGroqModelReport(
 async function runInterleavedGroqSuite(
   apiKey: string,
   candidates: readonly GroqCandidateSpec[],
-  originRttMedianMs: number | null,
 ) {
   const warmH1Instr = createInstrumentedAgent(false);
   const warmH2Instr = createInstrumentedAgent(true);
@@ -1505,7 +1649,7 @@ async function runInterleavedGroqSuite(
   for (const c of candidates) {
     const buckets = bucketsByRole.get(c.role);
     if (!buckets) continue;
-    reports.set(c.role, buildGroqModelReport(c.probeWithBudget.probe, buckets, originRttMedianMs));
+    reports.set(c.role, buildGroqModelReport(c.probeWithBudget.probe, buckets));
   }
   return reports;
 }
@@ -1513,7 +1657,7 @@ async function runInterleavedGroqSuite(
 async function benchmarkGeminiScenarioB(
   apiKey: string,
   probe: ModelProbeResult,
-  originRttMedianMs: number | null,
+  nRuns: number = N_RUNS,
 ) {
   const instr = createInstrumentedAgent(false);
   const runs: PlainRunSample[] = [];
@@ -1522,7 +1666,7 @@ async function benchmarkGeminiScenarioB(
 
   try {
     await listModels(GEMINI_BASE_URL, apiKey, instr.agent);
-    for (let i = 0; i < N_RUNS; i += 1) {
+    for (let i = 0; i < nRuns; i += 1) {
       const res = await runStreamingChat({
         baseUrl: GEMINI_BASE_URL,
         apiKey,
@@ -1534,7 +1678,7 @@ async function benchmarkGeminiScenarioB(
       });
       assertWarmConnection(`${probe.model}:B-h1[${i}]`, res.connection);
       runs.push(toPlainRunSample(res));
-      if (i + 1 < N_RUNS) {
+      if (i + 1 < nRuns) {
         await sleep(GEMINI_PACING_MS);
       }
     }
@@ -1545,13 +1689,6 @@ async function benchmarkGeminiScenarioB(
   const warmSummary = summarizePlainRuns(runs);
   return {
     settings: probe,
-    estimatedModelTimeMs: {
-      h1Ms:
-        warmSummary.ttftMs.median !== null && originRttMedianMs !== null
-          ? warmSummary.ttftMs.median - originRttMedianMs
-          : null,
-      originRttMedianMs,
-    },
     scenarioB_warm: warmSummary,
   };
 }
@@ -1559,27 +1696,31 @@ async function benchmarkGeminiScenarioB(
 function checkGroqRequestBudget(
   modelsBaselineHeaders: Record<string, string>,
   candidates: readonly GroqCandidateSpec[],
+  plannedRequestsByRole?: ReadonlyMap<string, number>,
+  budgetNote?: string,
 ): {
   readonly modelsEndpointHasRateLimitHeaders: boolean;
   readonly entries: readonly RequestBudgetEntry[];
 } {
   const modelsEndpointRemainingRaw = modelsBaselineHeaders["x-ratelimit-remaining-requests"];
   const modelsEndpointHasRateLimitHeaders = modelsEndpointRemainingRaw !== undefined;
-  const plannedLoopRequests = N_RUNS * GROQ_REQUESTS_PER_ITERATION;
+  const defaultPlanned = N_RUNS * GROQ_REQUESTS_PER_ITERATION;
 
   console.log("\n=== Groq Request Budget Check ===");
   console.log(
     `  /models x-ratelimit-remaining-requests: ${modelsEndpointRemainingRaw ?? "not returned by Groq GET /models (per-model limits are returned on POST /chat/completions)"}`,
   );
   console.log(
-    `  Planned per Groq model: N=${N_RUNS} x ${GROQ_REQUESTS_PER_ITERATION} req/iter ` +
-      `(A=1, B=1, B-h2=1, C-time=2, C-order=2, D-h1=2, D-h2=2) = ${plannedLoopRequests} loop requests`,
+    budgetNote ??
+      `  Planned per Groq model: N=${N_RUNS} x ${GROQ_REQUESTS_PER_ITERATION} req/iter ` +
+        `(A=1, B=1, B-h2=1, C-time=2, C-order=2, D-h1=2, D-h2=2) = ${defaultPlanned} loop requests`,
   );
 
   const entries: RequestBudgetEntry[] = [];
   const insufficient: RequestBudgetEntry[] = [];
 
   for (const c of candidates) {
+    const plannedLoopRequests = plannedRequestsByRole?.get(c.role) ?? defaultPlanned;
     const hdrs = c.probeWithBudget.rateLimitHeaders;
     const remStr = modelsEndpointRemainingRaw ?? hdrs["x-ratelimit-remaining-requests"];
     const limStr = hdrs["x-ratelimit-limit-requests"];
@@ -1650,14 +1791,33 @@ function formatConnectionLine(c: ReturnType<typeof summarizeConnectionMetrics>):
 }
 
 function printPlainSummary(label: string, s: ReturnType<typeof summarizePlainRuns>): void {
+  const regionTag = s.groqRegions.length > 0 ? `, region=${s.groqRegions.join(",")}` : "";
   console.log(
-    `  ${label} (n=${s.n}, proto=${s.protocols.join(",") || "unknown"}, edge=${s.edgeLocations.join(",") || "none"}):`,
+    `  ${label} (n=${s.n}, proto=${s.protocols.join(",") || "unknown"}, edge=${s.edgeLocations.join(",") || "none"}${regionTag}):`,
   );
   console.log(
-    `    TTFT: med=${formatMs(s.ttftMs.median)} p90=${formatMs(s.ttftMs.p90)} | ` +
+    `    TTFT(content): med=${formatMs(s.ttftMs.median)} p90=${formatMs(s.ttftMs.p90)} | ` +
+      `FirstToken(any): med=${formatMs(s.firstAnyTokenMs.median)} p90=${formatMs(s.firstAnyTokenMs.p90)} | ` +
       `FirstSent(abs): med=${formatMs(s.firstSentenceAbsMs.median)} p90=${formatMs(s.firstSentenceAbsMs.p90)} | ` +
       `FirstSent(rel): med=${formatMs(s.firstSentenceRelMs.median)} p90=${formatMs(s.firstSentenceRelMs.p90)}`,
   );
+  if (s.serverTimings.available) {
+    console.log(
+      `    ServerTimings(usage): queue med=${formatMs(s.serverTimings.queueTimeMs.median)} | ` +
+        `prompt med=${formatMs(s.serverTimings.promptTimeMs.median)} | ` +
+        `completion med=${formatMs(s.serverTimings.completionTimeMs.median)} | ` +
+        `preToken(queue+prompt) med=${formatMs(s.serverTimings.serverPreFirstTokenMs.median)} p90=${formatMs(s.serverTimings.serverPreFirstTokenMs.p90)} | ` +
+        `preContentEst med=${formatMs(s.serverTimings.serverPreContentEstMs.median)}`,
+    );
+    console.log(
+      `    NetworkSplit: net(FirstToken - queue+prompt) med=${formatMs(s.serverTimings.networkFirstTokenMs.median)} p90=${formatMs(s.serverTimings.networkFirstTokenMs.p90)} | ` +
+        `net(TTFT - preContentEst) med=${formatMs(s.serverTimings.networkContentTtftMs.median)} p90=${formatMs(s.serverTimings.networkContentTtftMs.p90)}`,
+    );
+  } else {
+    console.log(
+      `    ServerTimings: unavailable in usage (server-timing header: ${s.serverTimingHeaders.join(", ") || "none"})`,
+    );
+  }
   console.log(
     `    Total: med=${formatMs(s.totalMs.median)} p90=${formatMs(s.totalMs.p90)} | ` +
       `ReasoningTok: med=${s.reasoningTokens.median ?? 0} p90=${s.reasoningTokens.p90 ?? 0} | ` +
@@ -1670,8 +1830,9 @@ function printPlainSummary(label: string, s: ReturnType<typeof summarizePlainRun
 }
 
 function printToolSummary(label: string, c: ReturnType<typeof summarizeToolRuns>): void {
+  const regionTag = c.groqRegions.length > 0 ? `, region=${c.groqRegions.join(",")}` : "";
   console.log(
-    `  ${label} (n=${c.n}, proto=${c.protocols.join(",") || "unknown"}, edge=${c.edgeLocations.join(",") || "none"}):`,
+    `  ${label} (n=${c.n}, proto=${c.protocols.join(",") || "unknown"}, edge=${c.edgeLocations.join(",") || "none"}${regionTag}):`,
   );
   console.log(
     `    Correct(${c.expectedTool}): ${c.toolCorrectnessRate} | ` +
@@ -1679,8 +1840,12 @@ function printToolSummary(label: string, c: ReturnType<typeof summarizeToolRuns>
       `PreToolFiller: ${c.fillerRate}`,
   );
   console.log(
-    `    t_toolcall: med=${formatMs(c.tToolCallMs.median)} p90=${formatMs(c.tToolCallMs.p90)} | ` +
-      `t_exec: med=${formatMs(c.tExecMs.median)} p90=${formatMs(c.tExecMs.p90)} | ` +
+    `    req1_first_token: med=${formatMs(c.req1FirstAnyTokenMs.median)} p90=${formatMs(c.req1FirstAnyTokenMs.p90)} | ` +
+      `req1_ttft(content): med=${formatMs(c.req1TtftMs.median)} p90=${formatMs(c.req1TtftMs.p90)} | ` +
+      `t_toolcall: med=${formatMs(c.tToolCallMs.median)} p90=${formatMs(c.tToolCallMs.p90)}`,
+  );
+  console.log(
+    `    t_exec: med=${formatMs(c.tExecMs.median)} p90=${formatMs(c.tExecMs.p90)} | ` +
       `followup_ttft: med=${formatMs(c.followupTtftMs.median)} p90=${formatMs(c.followupTtftMs.p90)} | ` +
       `e2e: med=${formatMs(c.e2eMs.median)} p90=${formatMs(c.e2eMs.p90)}`,
   );
@@ -1699,11 +1864,6 @@ function printModelReport(
 ): void {
   console.log(
     `\n=== Groq [${role}] model=${report.settings.model} reasoning=${report.settings.reasoningEffort} format=${report.settings.reasoningFormat} ===`,
-  );
-  console.log(
-    `  Derived: model time ≈ warm TTFT - origin RTT -> ` +
-      `h1=${formatMs(report.estimatedModelTimeMs.h1Ms)} (${formatMs(report.scenarioB_warm.ttftMs.median)} - ${formatMs(report.estimatedModelTimeMs.originRttMedianMs)}), ` +
-      `h2=${formatMs(report.estimatedModelTimeMs.h2Ms)} (${formatMs(report.scenarioB_warmH2.ttftMs.median)} - ${formatMs(report.estimatedModelTimeMs.originRttMedianMs)})`,
   );
   printPlainSummary("Scenario A (Cold)", report.scenarioA_cold);
   printPlainSummary("Scenario B (Warm H1)", report.scenarioB_warm);
@@ -1773,9 +1933,296 @@ async function printAvailableModels(): Promise<void> {
   }
 }
 
+async function runTask3cDiagnosis(): Promise<void> {
+  loadEnvFromRoot();
+  const cfg: SpikeEnvConfig = loadSpikeConfig(process.env);
+  if (!cfg.groqModelNoReason) {
+    throw new Error("GROQ_MODEL_NOREASON is required for --task3c");
+  }
+  const qwenModel = cfg.groqModelNoReason;
+
+  const groqBase = await measureBaseline("Groq", GROQ_BASE_URL, cfg.groqApiKey);
+  const requestedGroqModels = [cfg.groqModelFast, cfg.groqModelReliable, qwenModel];
+  assertModelsPresent("Groq", requestedGroqModels, groqBase.modelIds);
+
+  const fastProbe = await probeReasoningSettings(
+    GROQ_BASE_URL,
+    cfg.groqApiKey,
+    cfg.groqModelFast,
+    cfg.groqFastReasoningEffort,
+    true,
+  );
+  const reliableProbe = await probeReasoningSettings(
+    GROQ_BASE_URL,
+    cfg.groqApiKey,
+    cfg.groqModelReliable,
+    cfg.groqReliableReasoningEffort,
+    true,
+  );
+  const qwenNoneProbe = await probeReasoningSettings(
+    GROQ_BASE_URL,
+    cfg.groqApiKey,
+    qwenModel,
+    cfg.groqNoReasonReasoningEffort ?? "none",
+    true,
+  );
+  // Probe lowest non-none active reasoning setting ("low"; "minimal" -> 400, "default" -> 0 reasoning tokens).
+  const qwenLowProbe = await probeReasoningSettings(
+    GROQ_BASE_URL,
+    cfg.groqApiKey,
+    qwenModel,
+    "low",
+    true,
+  );
+
+  const groqCandidates: GroqCandidateSpec[] = [
+    { role: "fast", model: cfg.groqModelFast, probeWithBudget: fastProbe },
+    { role: "reliable", model: cfg.groqModelReliable, probeWithBudget: reliableProbe },
+    {
+      role: "noreason",
+      model: qwenModel,
+      probeWithBudget: {
+        probe: qwenNoneProbe.probe,
+        probeRequestsSpent: qwenNoneProbe.probeRequestsSpent + qwenLowProbe.probeRequestsSpent,
+        rateLimitHeaders: qwenLowProbe.rateLimitHeaders,
+      },
+    },
+  ];
+
+  // Planned requests: N=10 warm H2 per model, plus 3 variants x 2 scenarios x N=10 x up to 2 reqs on qwen.
+  const plannedMap = new Map<string, number>([
+    ["fast", N_TASK3C],
+    ["reliable", N_TASK3C],
+    ["noreason", N_TASK3C + 3 * 2 * N_TASK3C * 2],
+  ]);
+  const budget = checkGroqRequestBudget(
+    groqBase.baseline.rateLimitHeaders,
+    groqCandidates,
+    plannedMap,
+    `  Planned Task 3c: fast=${N_TASK3C} (warm H2), reliable=${N_TASK3C} (warm H2), noreason=${N_TASK3C + 120} (10 warm H2 + max 120 across 3 qwen tool variants x 2 utterances x N=${N_TASK3C})`,
+  );
+
+  // Part 2b: Fresh N=10 interleaved warm H2 run per Groq model to extract server-side timings.
+  const warmH2Instr = createInstrumentedAgent(true);
+  const pacer = new PerModelRatePacer();
+  const warmH2Buckets = new Map<string, PlainRunSample[]>([
+    ["fast", []],
+    ["reliable", []],
+    ["noreason", []],
+  ]);
+
+  try {
+    await listModels(GROQ_BASE_URL, cfg.groqApiKey, warmH2Instr.agent);
+    for (let i = 0; i < N_TASK3C; i += 1) {
+      for (const c of groqCandidates) {
+        const probe = c.probeWithBudget.probe;
+        const reasoningEffort =
+          probe.reasoningEffort === "not_applicable" ? undefined : probe.reasoningEffort;
+        await pacer.waitForModel(c.model);
+        const res = await runStreamingChat({
+          baseUrl: GROQ_BASE_URL,
+          apiKey: cfg.groqApiKey,
+          model: probe.model,
+          prompt: PLAIN_PROMPT,
+          tools: VOICE_TOOLS,
+          reasoningEffort,
+          reasoningFormat: probe.reasoningFormat,
+          instr: warmH2Instr,
+        });
+        assertWarmConnection(`${probe.model}:3c-B-h2[${i}]`, res.connection);
+        warmH2Buckets.get(c.role)?.push(toPlainRunSample(res));
+        pacer.recordRequests(c.model, 1, GROQ_PACING_MS);
+      }
+      console.log(`[Task3c:WarmH2] completed iteration ${i + 1}/${N_TASK3C}`);
+    }
+  } finally {
+    await warmH2Instr.close();
+  }
+
+  console.log("\n=== Task 3c Part 2: Server-Side Timing Split (Fresh N=10 Warm H2 per Groq model) ===");
+  const warmH2Summaries = new Map<string, ReturnType<typeof summarizePlainRuns>>();
+  for (const c of groqCandidates) {
+    const summary = summarizePlainRuns(warmH2Buckets.get(c.role) ?? []);
+    warmH2Summaries.set(c.role, summary);
+    console.log(`\n  [${c.role.toUpperCase()}] ${c.model} (reasoning=${c.probeWithBudget.probe.reasoningEffort})`);
+    printPlainSummary("Scenario B-h2 (Warm H2)", summary);
+  }
+
+  let geminiBaseline: HostBaseline | null = null;
+  let geminiWarmB: Awaited<ReturnType<typeof benchmarkGeminiScenarioB>> | null = null;
+  if (cfg.geminiApiKey && cfg.geminiModel) {
+    const gemBase = await measureBaseline("Gemini", GEMINI_BASE_URL, cfg.geminiApiKey);
+    geminiBaseline = gemBase.baseline;
+    assertModelsPresent("Gemini", [cfg.geminiModel], gemBase.modelIds);
+    const gemProbe = await probeReasoningSettings(
+      GEMINI_BASE_URL,
+      cfg.geminiApiKey,
+      cfg.geminiModel,
+      cfg.geminiReasoningEffort,
+      false,
+    );
+    geminiWarmB = await benchmarkGeminiScenarioB(cfg.geminiApiKey, gemProbe.probe, N_TASK3C);
+    console.log(`\n  [GEMINI] ${cfg.geminiModel} (thinking=${gemProbe.probe.reasoningEffort})`);
+    printPlainSummary("Scenario B (Warm H1)", geminiWarmB.scenarioB_warm);
+  }
+
+  // Part 1a: Exact request body for one tool-path request to qwen (no headers, no key).
+  const sampleToolBody = buildChatRequestBody({
+    model: qwenModel,
+    prompt: TIME_TOOL_PROMPT,
+    tools: VOICE_TOOLS,
+    toolChoice: "auto",
+    reasoningEffort: qwenNoneProbe.probe.reasoningEffort === "not_applicable" ? undefined : qwenNoneProbe.probe.reasoningEffort,
+    reasoningFormat: qwenNoneProbe.probe.reasoningFormat,
+  });
+  console.log("\n=== Task 3c Part 1a: Exact Request Body (qwen tool-path, no headers, no key) ===");
+  console.log(JSON.stringify(sampleToolBody, null, 2));
+
+  // Part 1d: Rerun C-time and C-order on qwen only, N=10 each, in 3 variants.
+  const variants: ReadonlyArray<{
+    readonly id: string;
+    readonly label: string;
+    readonly probe: ModelProbeResult;
+    readonly toolChoiceReq1: ToolChoiceOption;
+  }> = [
+    {
+      id: "v1_as_before",
+      label: "(i) as before (reasoning=none, tool_choice=auto)",
+      probe: qwenNoneProbe.probe,
+      toolChoiceReq1: "auto",
+    },
+    {
+      id: "v2_tool_choice_required",
+      label: "(ii) tool_choice=required (reasoning=none)",
+      probe: qwenNoneProbe.probe,
+      toolChoiceReq1: "required",
+    },
+    {
+      id: "v3_reasoning_low",
+      label: "(iii) reasoning_effort=low (lowest non-none, tool_choice=auto)",
+      probe: qwenLowProbe.probe,
+      toolChoiceReq1: "auto",
+    },
+  ];
+
+  const qwenVariantResults: Array<{
+    readonly id: string;
+    readonly label: string;
+    readonly settings: ModelProbeResult;
+    readonly toolChoiceReq1: ToolChoiceOption;
+    readonly cTime: ReturnType<typeof summarizeToolRuns>;
+    readonly cOrder: ReturnType<typeof summarizeToolRuns>;
+  }> = [];
+
+  const qwenInstr = createInstrumentedAgent(true);
+  // Tool turns send ~950 tokens across req1+req2; pace at 4000 ms/req (8000 ms/turn) to stay under Groq's 8,000 TPM free-tier cap.
+  const qwenToolPacingMs = 4000;
+  try {
+    await listModels(GROQ_BASE_URL, cfg.groqApiKey, qwenInstr.agent);
+    for (const variant of variants) {
+      const timeRuns: ToolRunSample[] = [];
+      const orderRuns: ToolRunSample[] = [];
+      for (let i = 0; i < N_TASK3C; i += 1) {
+        await pacer.waitForModel(qwenModel);
+        const tSample = await runToolTurn(
+          cfg.groqApiKey,
+          variant.probe,
+          qwenInstr,
+          TIME_TOOL_PROMPT,
+          validateCurrentTimeToolCalls,
+          `${qwenModel}:${variant.id}:C-time[${i}]`,
+          variant.toolChoiceReq1,
+        );
+        timeRuns.push(tSample);
+        pacer.recordRequests(qwenModel, tSample.connectionReq2 ? 2 : 1, qwenToolPacingMs);
+
+        await pacer.waitForModel(qwenModel);
+        const oSample = await runToolTurn(
+          cfg.groqApiKey,
+          variant.probe,
+          qwenInstr,
+          ORDER_TOOL_PROMPT,
+          validateOrderStatusToolCalls,
+          `${qwenModel}:${variant.id}:C-order[${i}]`,
+          variant.toolChoiceReq1,
+        );
+        orderRuns.push(oSample);
+        pacer.recordRequests(qwenModel, oSample.connectionReq2 ? 2 : 1, qwenToolPacingMs);
+      }
+
+      const cTime = summarizeToolRuns("time", TIME_TOOL_PROMPT, "get_current_time", timeRuns);
+      const cOrder = summarizeToolRuns("order", ORDER_TOOL_PROMPT, "get_order_status", orderRuns);
+      qwenVariantResults.push({
+        id: variant.id,
+        label: variant.label,
+        settings: variant.probe,
+        toolChoiceReq1: variant.toolChoiceReq1,
+        cTime,
+        cOrder,
+      });
+
+      console.log(`\n=== Task 3c Part 1d [${variant.label}] ===`);
+      printToolSummary("Scenario C-time", cTime);
+      printToolSummary("Scenario C-order", cOrder);
+
+      if (variant.id === "v1_as_before") {
+        console.log("\n=== Task 3c Part 1b: Full text of 3 plain-text replies per utterance (variant i) ===");
+        console.log("  C-time plain-text samples:");
+        cTime.plainTextSamples.forEach((s, idx) => {
+          console.log(`    [${idx + 1}] finish_reason=${s.finishReason} ttft=${formatMs(s.ttftMs)} text=${JSON.stringify(s.content)}`);
+        });
+        console.log("  C-order plain-text samples:");
+        cOrder.plainTextSamples.forEach((s, idx) => {
+          console.log(`    [${idx + 1}] finish_reason=${s.finishReason} ttft=${formatMs(s.ttftMs)} text=${JSON.stringify(s.content)}`);
+        });
+      }
+      if (variant.id === "v3_reasoning_low") {
+        const orderFillers = orderRuns.filter((r) => r.emittedContentBeforeToolCall).slice(0, 3);
+        if (orderFillers.length > 0) {
+          console.log("  C-order pre-tool filler samples (variant iii):");
+          orderFillers.forEach((s, idx) => {
+            console.log(`    [${idx + 1}] preToolTtft=${formatMs(s.preToolContentTtftMs)} text=${JSON.stringify(s.req1Content)}`);
+          });
+        }
+      }
+    }
+  } finally {
+    await qwenInstr.close();
+  }
+
+  mkdirSync(OUT_DIR, { recursive: true });
+  const payload = {
+    timestamp: new Date().toISOString(),
+    nodeVersion: process.version,
+    promptVersion: PROMPT_VERSION,
+    nTask3c: N_TASK3C,
+    budget,
+    baselines: {
+      groqControlPlane: groqBase.baseline,
+      geminiControlPlane: geminiBaseline,
+    },
+    warmH2ServerTimingSplit: {
+      fast: warmH2Summaries.get("fast") ?? null,
+      reliable: warmH2Summaries.get("reliable") ?? null,
+      noreason: warmH2Summaries.get("noreason") ?? null,
+      geminiWarmB,
+    },
+    qwenDiagnosis: {
+      sampleToolRequestBody: sampleToolBody,
+      variants: qwenVariantResults,
+    },
+  };
+  writeFileSync(TASK3C_RESULTS_PATH, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  console.log(`\nSaved Task 3c results to ${TASK3C_RESULTS_PATH}`);
+}
+
 async function main(): Promise<void> {
   if (process.argv.includes("--list-models")) {
     await printAvailableModels();
+    return;
+  }
+  if (process.argv.includes("--task3c")) {
+    await runTask3cDiagnosis();
     return;
   }
 
@@ -1829,11 +2276,9 @@ async function main(): Promise<void> {
 
   const budget = checkGroqRequestBudget(groqBase.baseline.rateLimitHeaders, groqCandidates);
 
-  const groqOriginRttMedian = groqBase.baseline.originRttMs.median;
   const groqReports = await runInterleavedGroqSuite(
     cfg.groqApiKey,
     groqCandidates,
-    groqOriginRttMedian,
   );
 
   const fastReport = groqReports.get("fast");
@@ -1866,13 +2311,9 @@ async function main(): Promise<void> {
     geminiReport = await benchmarkGeminiScenarioB(
       cfg.geminiApiKey,
       gemProbe.probe,
-      gemBase.baseline.originRttMs.median,
     );
     console.log(
       `\n=== Gemini [FAILOVER] model=${geminiReport.settings.model} thinking=${geminiReport.settings.reasoningEffort} ===`,
-    );
-    console.log(
-      `  Derived: model time ≈ warm TTFT - origin RTT -> ${formatMs(geminiReport.estimatedModelTimeMs.h1Ms)} (${formatMs(geminiReport.scenarioB_warm.ttftMs.median)} - ${formatMs(geminiReport.estimatedModelTimeMs.originRttMedianMs)})`,
     );
     printPlainSummary("Scenario B (Warm)", geminiReport.scenarioB_warm);
   }
