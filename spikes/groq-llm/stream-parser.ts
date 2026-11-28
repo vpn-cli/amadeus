@@ -27,9 +27,26 @@ export interface RawStreamUsage {
   };
 }
 
+export interface StreamErrorInfo {
+  readonly message: string;
+  readonly code: string | null;
+  readonly type: string | null;
+  readonly failedGeneration: string | null;
+  readonly statusCode: number | null;
+}
+
+export interface RawStreamError {
+  readonly message?: string;
+  readonly type?: string;
+  readonly code?: string;
+  readonly failed_generation?: string;
+  readonly status_code?: number;
+}
+
 export interface RawChatCompletionChunk {
   readonly id?: string;
   readonly model?: string;
+  readonly error?: RawStreamError | string;
   readonly choices?: ReadonlyArray<{
     readonly index?: number;
     readonly finish_reason?: string | null;
@@ -80,6 +97,7 @@ export interface StreamDeltaStep {
   readonly reasoningDelta: string;
   readonly hasToolCallDelta: boolean;
   readonly finishReason: string | null;
+  readonly error: StreamErrorInfo | null;
 }
 
 export interface ParsedStreamResult {
@@ -87,6 +105,7 @@ export interface ParsedStreamResult {
   readonly reasoning: string;
   readonly toolCalls: readonly AssembledToolCall[];
   readonly finishReason: string | null;
+  readonly streamError: StreamErrorInfo | null;
   readonly usage: StreamUsage;
   readonly emittedContentBeforeToolCall: boolean;
   readonly chunkCount: number;
@@ -122,6 +141,7 @@ export class GroqStreamAccumulator {
   private reasoning = "";
   private readonly toolCalls = new Map<number, MutableToolCall>();
   private finishReason: string | null = null;
+  private streamError: StreamErrorInfo | null = null;
   private usage: StreamUsage = {
     promptTokens: null,
     completionTokens: null,
@@ -139,7 +159,7 @@ export class GroqStreamAccumulator {
   private contentDeltaCount = 0;
   private reasoningDeltaCount = 0;
 
-  pushEventData(data: string): StreamDeltaStep {
+  pushEventData(data: string, eventName?: string): StreamDeltaStep {
     const trimmed = data.trim();
     if (trimmed === "[DONE]") {
       return {
@@ -149,11 +169,81 @@ export class GroqStreamAccumulator {
         reasoningDelta: "",
         hasToolCallDelta: false,
         finishReason: this.finishReason,
+        error: null,
       };
     }
 
-    const chunk = JSON.parse(trimmed) as RawChatCompletionChunk;
+    let chunk: RawChatCompletionChunk;
+    try {
+      chunk = JSON.parse(trimmed) as RawChatCompletionChunk;
+    } catch (err) {
+      if (eventName === "error") {
+        const streamErr: StreamErrorInfo = {
+          message: trimmed.length > 0 ? trimmed : "SSE error event",
+          code: null,
+          type: null,
+          failedGeneration: null,
+          statusCode: null,
+        };
+        this.streamError = streamErr;
+        return {
+          done: false,
+          contentDelta: "",
+          isFirstContentDelta: false,
+          reasoningDelta: "",
+          hasToolCallDelta: false,
+          finishReason: this.finishReason,
+          error: streamErr,
+        };
+      }
+      throw err;
+    }
+
     this.chunkCount += 1;
+
+    if (chunk.error !== undefined || eventName === "error") {
+      const rawErr = chunk.error;
+      let streamErr: StreamErrorInfo;
+      if (typeof rawErr === "object" && rawErr !== null) {
+        streamErr = {
+          message:
+            typeof rawErr.message === "string" && rawErr.message.trim().length > 0
+              ? rawErr.message
+              : JSON.stringify(rawErr),
+          code: typeof rawErr.code === "string" ? rawErr.code : null,
+          type: typeof rawErr.type === "string" ? rawErr.type : null,
+          failedGeneration:
+            typeof rawErr.failed_generation === "string" ? rawErr.failed_generation : null,
+          statusCode: typeof rawErr.status_code === "number" ? rawErr.status_code : null,
+        };
+      } else if (typeof rawErr === "string") {
+        streamErr = {
+          message: rawErr,
+          code: null,
+          type: null,
+          failedGeneration: null,
+          statusCode: null,
+        };
+      } else {
+        streamErr = {
+          message: trimmed.length > 0 ? trimmed : "SSE error event",
+          code: null,
+          type: null,
+          failedGeneration: null,
+          statusCode: null,
+        };
+      }
+      this.streamError = streamErr;
+      return {
+        done: false,
+        contentDelta: "",
+        isFirstContentDelta: false,
+        reasoningDelta: "",
+        hasToolCallDelta: false,
+        finishReason: this.finishReason,
+        error: streamErr,
+      };
+    }
 
     const usageSource = chunk.usage ?? chunk.x_groq?.usage;
     if (usageSource !== undefined) {
@@ -179,6 +269,7 @@ export class GroqStreamAccumulator {
         reasoningDelta: "",
         hasToolCallDelta: false,
         finishReason: this.finishReason,
+        error: null,
       };
     }
 
@@ -243,6 +334,7 @@ export class GroqStreamAccumulator {
       reasoningDelta,
       hasToolCallDelta,
       finishReason: this.finishReason,
+      error: null,
     };
   }
 
@@ -274,6 +366,7 @@ export class GroqStreamAccumulator {
       reasoning: this.reasoning,
       toolCalls: assembled,
       finishReason: this.finishReason,
+      streamError: this.streamError,
       usage: this.usage,
       emittedContentBeforeToolCall: this.emittedContentBeforeToolCall,
       chunkCount: this.chunkCount,
@@ -283,12 +376,30 @@ export class GroqStreamAccumulator {
   }
 }
 
+export function formatStreamErrorReason(streamError: StreamErrorInfo): string {
+  const codePrefix = streamError.code ? `[${streamError.code}] ` : "";
+  return `stream_error: ${codePrefix}${streamError.message}`;
+}
+
 function validateToolCallWithSchema<T>(
   toolCalls: readonly AssembledToolCall[],
   expectedToolName: string,
   schema: { safeParse: (input: unknown) => { success: true; data: T } | { success: false } },
   checkArgs?: (data: T) => { readonly ok: boolean; readonly correctOrderId: boolean; readonly failReason: string },
+  streamError?: StreamErrorInfo | null,
 ): ToolValidationResult {
+  if (streamError !== undefined && streamError !== null) {
+    return {
+      calledAnyTool: false,
+      calledExpectedTool: false,
+      validJsonArgs: false,
+      validArgsSchema: false,
+      correctOrderId: false,
+      passed: false,
+      reason: formatStreamErrorReason(streamError),
+    };
+  }
+
   if (toolCalls.length === 0) {
     return {
       calledAnyTool: false,
@@ -365,21 +476,35 @@ function validateToolCallWithSchema<T>(
 
 export function validateOrderStatusToolCalls(
   toolCalls: readonly AssembledToolCall[],
+  streamError?: StreamErrorInfo | null,
 ): ToolValidationResult {
-  return validateToolCallWithSchema(toolCalls, "get_order_status", OrderStatusArgsSchema, (data) => {
-    const correctOrderId = data.order_id === EXPECTED_ORDER_ID;
-    return {
-      ok: correctOrderId,
-      correctOrderId,
-      failReason: `wrong_order_id:${data.order_id}`,
-    };
-  });
+  return validateToolCallWithSchema(
+    toolCalls,
+    "get_order_status",
+    OrderStatusArgsSchema,
+    (data) => {
+      const correctOrderId = data.order_id === EXPECTED_ORDER_ID;
+      return {
+        ok: correctOrderId,
+        correctOrderId,
+        failReason: `wrong_order_id:${data.order_id}`,
+      };
+    },
+    streamError,
+  );
 }
 
 export function validateCurrentTimeToolCalls(
   toolCalls: readonly AssembledToolCall[],
+  streamError?: StreamErrorInfo | null,
 ): ToolValidationResult {
-  return validateToolCallWithSchema(toolCalls, "get_current_time", CurrentTimeArgsSchema);
+  return validateToolCallWithSchema(
+    toolCalls,
+    "get_current_time",
+    CurrentTimeArgsSchema,
+    undefined,
+    streamError,
+  );
 }
 
 const CLAIMED_CHECK_PATTERN =

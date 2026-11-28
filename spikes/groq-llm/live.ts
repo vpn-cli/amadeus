@@ -15,8 +15,10 @@ import {
   OrderStatusArgsSchema,
   PLAIN_PROMPT,
   PROMPT_VERSION,
+  PROMPT_VERSION_V1,
   PROMPT_VERSION_V2,
   SYSTEM_PROMPT,
+  SYSTEM_PROMPT_V1,
   SYSTEM_PROMPT_V2,
   TASK3D_MODEL_IDS,
   TIME_TOOL_PROMPT,
@@ -24,6 +26,7 @@ import {
   TOOL_SCHEMA_VERSION_V1,
   TOOL_SCHEMA_VERSION_V2,
   VOICE_TOOLS,
+  VOICE_TOOLS_V1,
   VOICE_TOOLS_V2,
   loadApiKeysConfig,
   loadSpikeConfig,
@@ -31,9 +34,11 @@ import {
   parseTask3dModelFilter,
   type GroqServiceTier,
   type OpenAiToolDefinition,
+  type PromptVersion,
   type ReasoningEffort,
   type SpikeEnvConfig,
   type Task3dModelId,
+  type ToolSchemaVersion,
 } from "./config.js";
 import { SentenceSplitter } from "./sentence-splitter.js";
 import { SseParser } from "./sse.js";
@@ -41,17 +46,22 @@ import { formatMs, formatPct, summarize, type DistributionStats } from "./stats.
 import {
   GroqStreamAccumulator,
   detectClaimedCheckWithoutToolCall,
+  formatStreamErrorReason,
   isDailyRateLimitBody,
   validateCurrentTimeToolCalls,
   validateOrderStatusToolCalls,
   type AssembledToolCall,
   type ParsedStreamResult,
+  type StreamErrorInfo,
   type ToolValidationResult,
 } from "./stream-parser.js";
 import {
   GROQ_TPD_LIMIT,
   appendUsageLedgerEntry,
+  estimateMedianTokensForModel,
   evaluateGroqTokenBudgets,
+  getLedgerCoverageInfo,
+  parseAssumeUsedArgs,
   readUsageLedger,
   type ModelTokenBudget,
   type PlannedModelRequests,
@@ -215,6 +225,7 @@ interface ToolRunSample {
   readonly req1FirstAnyTokenMs: number | null;
   readonly req1Content: string;
   readonly req1FinishReason: string | null;
+  readonly req1StreamError: StreamErrorInfo | null;
   readonly req1ServerQueueMs: number | null;
   readonly req2ServerQueueMs: number | null;
   readonly tToolCallMs: number | null;
@@ -747,7 +758,7 @@ async function runStreamingChat(opts: ChatRequestOptions): Promise<ChatStreamOut
           deltasAfterAbort += 1;
           continue;
         }
-        const step = acc.pushEventData(evt.data);
+        const step = acc.pushEventData(evt.data, evt.event);
         if (step.done) continue;
         if (
           firstAnyTokenMs === null &&
@@ -791,7 +802,7 @@ async function runStreamingChat(opts: ChatRequestOptions): Promise<ChatStreamOut
     } else {
       const flushNow = performance.now();
       for (const evt of sse.flush()) {
-        const step = acc.pushEventData(evt.data);
+        const step = acc.pushEventData(evt.data, evt.event);
         if (step.done) continue;
         if (
           firstAnyTokenMs === null &&
@@ -837,22 +848,33 @@ async function runStreamingChat(opts: ChatRequestOptions): Promise<ChatStreamOut
     opts.instr.getLastProtocol(),
   );
 
-  if (
-    opts.baseUrl === GROQ_BASE_URL &&
-    (parsed.usage.totalTokens !== null ||
+  if (opts.baseUrl === GROQ_BASE_URL) {
+    if (
+      parsed.usage.totalTokens !== null ||
       parsed.usage.promptTokens !== null ||
-      parsed.usage.completionTokens !== null)
-  ) {
-    const promptTokens = parsed.usage.promptTokens ?? 0;
-    const completionTokens = parsed.usage.completionTokens ?? 0;
-    const totalTokens = parsed.usage.totalTokens ?? promptTokens + completionTokens;
-    appendUsageLedgerEntry(USAGE_LEDGER_PATH, {
-      ts: new Date().toISOString(),
-      model: opts.model,
-      prompt_tokens: promptTokens,
-      completion_tokens: completionTokens,
-      total_tokens: totalTokens,
-    });
+      parsed.usage.completionTokens !== null
+    ) {
+      const promptTokens = parsed.usage.promptTokens ?? 0;
+      const completionTokens = parsed.usage.completionTokens ?? 0;
+      const totalTokens = parsed.usage.totalTokens ?? promptTokens + completionTokens;
+      appendUsageLedgerEntry(USAGE_LEDGER_PATH, {
+        ts: new Date().toISOString(),
+        model: opts.model,
+        prompt_tokens: promptTokens,
+        completion_tokens: completionTokens,
+        total_tokens: totalTokens,
+      });
+    } else {
+      const est = estimateMedianTokensForModel(readUsageLedger(USAGE_LEDGER_PATH), opts.model);
+      appendUsageLedgerEntry(USAGE_LEDGER_PATH, {
+        ts: new Date().toISOString(),
+        model: opts.model,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: est.tokens,
+        estimated: true,
+      });
+    }
   }
 
   return {
@@ -1255,7 +1277,10 @@ async function runToolTurn(
   probe: ModelProbeResult,
   warmInstr: InstrumentedAgent,
   prompt: string,
-  validate: (toolCalls: readonly AssembledToolCall[]) => ToolValidationResult,
+  validate: (
+    toolCalls: readonly AssembledToolCall[],
+    streamError?: StreamErrorInfo | null,
+  ) => ToolValidationResult,
   label: string,
   toolChoiceReq1: ToolChoiceOption = "auto",
   options: {
@@ -1284,7 +1309,7 @@ async function runToolTurn(
   });
   assertWarmConnection(`${label}:req1`, req1.connection);
 
-  const validation = validate(req1.parsed.toolCalls);
+  const validation = validate(req1.parsed.toolCalls, req1.parsed.streamError);
   let tExecMs: number | null = null;
   let followupTtftMs: number | null = null;
   let followupFirstSentenceAbsMs: number | null = null;
@@ -1368,6 +1393,7 @@ async function runToolTurn(
     req1FirstAnyTokenMs: req1.firstAnyTokenMs,
     req1Content: req1.parsed.content,
     req1FinishReason: req1.parsed.finishReason,
+    req1StreamError: req1.parsed.streamError,
     req1ServerQueueMs: req1.parsed.usage.queueTimeMs,
     req2ServerQueueMs,
     tToolCallMs: req1.toolCallAssembledMs,
@@ -1776,22 +1802,44 @@ async function benchmarkGeminiScenarioB(
 function checkGroqTokenBudget(
   plans: readonly PlannedModelRequests[],
   ledgerPath: string = USAGE_LEDGER_PATH,
+  assumedUsedByModel: ReadonlyMap<string, number> = new Map(),
 ): readonly ModelTokenBudget[] {
   const entries = readUsageLedger(ledgerPath);
-  const evaluation = evaluateGroqTokenBudgets(entries, plans);
+  const coverage = getLedgerCoverageInfo(entries);
+  const evaluation = evaluateGroqTokenBudgets(
+    entries,
+    plans,
+    Date.now(),
+    GROQ_TPD_LIMIT,
+    assumedUsedByModel,
+  );
 
   console.log(
     `\n=== Groq Token Budget Check (limit=${GROQ_TPD_LIMIT.toLocaleString("en-US")} TPD/model) ===`,
   );
   console.log(`  Ledger: ${ledgerPath} (${entries.length} recorded requests)`);
+  if (coverage.isYoungerThan24h) {
+    if (coverage.ageMs === null) {
+      console.warn(
+        "  [WARN] Usage ledger is empty (younger than 24 h) — earlier usage is not tracked; pass --assume-used <model>=<tokens> to include pre-ledger usage.",
+      );
+    } else {
+      const hours = (coverage.ageMs / 3_600_000).toFixed(1);
+      console.warn(
+        `  [WARN] Usage ledger is younger than 24 h (${hours} h since ${coverage.oldestTs}) — earlier usage in the 24 h window is not tracked; pass --assume-used <model>=<tokens> to include it.`,
+      );
+    }
+  }
   for (const b of evaluation.models) {
     const estDetail =
       b.estimatedTokensSource === "ledger_median"
         ? `median=${b.medianTokensPerRequest} tok/req from ${b.ledgerSamples} ledger samples`
         : `default=${b.medianTokensPerRequest} tok/req (no ledger data)`;
+    const assumedStr =
+      b.assumedUsed !== undefined && b.assumedUsed > 0 ? ` (incl. assumed=${b.assumedUsed})` : "";
     console.log(
       `  ${b.model}: planned=${b.plannedRequests} reqs | est=${b.estimatedTokens} tok (${estDetail}) | ` +
-        `used_24h=${b.usedLast24h} tok | projected=${b.projectedTotalTokens}/${b.limitTpd} -> ${b.withinLimit ? "OK" : "STOP"}`,
+        `used_24h=${b.usedLast24h} tok${assumedStr} | projected=${b.projectedTotalTokens}/${b.limitTpd} -> ${b.withinLimit ? "OK" : "STOP"}`,
     );
   }
 
@@ -2059,11 +2107,16 @@ async function runTask3cDiagnosis(): Promise<void> {
   }
   const qwenModel = cfg.groqModelNoReason;
 
-  checkGroqTokenBudget([
-    { model: cfg.groqModelFast, plannedRequests: N_TASK3C + 2 },
-    { model: cfg.groqModelReliable, plannedRequests: N_TASK3C + 2 },
-    { model: qwenModel, plannedRequests: N_TASK3C + 3 * 2 * N_TASK3C * 2 + 4 },
-  ]);
+  const assumedUsed = parseAssumeUsedArgs(process.argv.slice(2));
+  checkGroqTokenBudget(
+    [
+      { model: cfg.groqModelFast, plannedRequests: N_TASK3C + 2 },
+      { model: cfg.groqModelReliable, plannedRequests: N_TASK3C + 2 },
+      { model: qwenModel, plannedRequests: N_TASK3C + 3 * 2 * N_TASK3C * 2 + 4 },
+    ],
+    USAGE_LEDGER_PATH,
+    assumedUsed,
+  );
 
   const groqBase = await measureBaseline("Groq", GROQ_BASE_URL, cfg.groqApiKey);
   const requestedGroqModels = [cfg.groqModelFast, cfg.groqModelReliable, qwenModel];
@@ -2557,7 +2610,8 @@ async function runTask3dExperiment(): Promise<void> {
       plannedRequests: reliableMatrixPlannedMax + 1 + GROQ_SERVICE_TIERS.length,
     });
   }
-  const tokenBudget = checkGroqTokenBudget(tokenPlans);
+  const assumedUsed = parseAssumeUsedArgs(process.argv.slice(2));
+  const tokenBudget = checkGroqTokenBudget(tokenPlans, USAGE_LEDGER_PATH, assumedUsed);
 
   const groqBase = await measureBaseline("Groq", GROQ_BASE_URL, cfg.groqApiKey);
   const requiredModels = [
@@ -2841,13 +2895,19 @@ async function runTask3dExperiment(): Promise<void> {
               res.parsed.content,
               res.parsed.toolCalls.length,
             );
-            const failureReason = calledAnyTool
-              ? `unwanted_tool:${res.parsed.toolCalls.map((t) => t.name).join(",")}`
-              : res.parsed.content.trim().length === 0
-                ? "empty_reply"
-                : null;
+            const failureReason =
+              res.parsed.streamError !== null
+                ? formatStreamErrorReason(res.parsed.streamError)
+                : calledAnyTool
+                  ? `unwanted_tool:${res.parsed.toolCalls.map((t) => t.name).join(",")}`
+                  : res.parsed.content.trim().length === 0
+                    ? "empty_reply"
+                    : null;
             cellBuckets.get(key)?.push({
-              correct: !calledAnyTool && res.parsed.content.trim().length > 0,
+              correct:
+                res.parsed.streamError === null &&
+                !calledAnyTool &&
+                res.parsed.content.trim().length > 0,
               calledAnyTool,
               wrongOrUnwantedToolCall: calledAnyTool,
               claimedToCheckWithoutToolCall: claimed,
@@ -3028,6 +3088,229 @@ async function runTask3dExperiment(): Promise<void> {
   console.log(`\nSaved Task 3d results to ${outPath}`);
 }
 
+function parseCliIntFlag(argv: readonly string[], flag: string, fallback: number): number {
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i] ?? "";
+    if (arg.startsWith(`${flag}=`)) {
+      const val = Number(arg.slice(flag.length + 1));
+      if (!Number.isInteger(val) || val <= 0) {
+        throw new Error(`${flag} must be a positive integer`);
+      }
+      return val;
+    }
+    if (arg === flag) {
+      const next = argv[i + 1];
+      const val = Number(next);
+      if (next === undefined || !Number.isInteger(val) || val <= 0) {
+        throw new Error(`${flag} requires a positive integer`);
+      }
+      return val;
+    }
+  }
+  return fallback;
+}
+
+function parseCliStringFlag(argv: readonly string[], flag: string): string | null {
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i] ?? "";
+    if (arg.startsWith(`${flag}=`)) {
+      return arg.slice(flag.length + 1).trim();
+    }
+    if (arg === flag) {
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith("--")) {
+        throw new Error(`${flag} requires a value`);
+      }
+      return next.trim();
+    }
+  }
+  return null;
+}
+
+async function runCtimeDiagnosis(): Promise<void> {
+  loadEnvFromRoot();
+  const cfg: SpikeEnvConfig = loadSpikeConfig(process.env);
+  const argv = process.argv.slice(2);
+  const nRuns = parseCliIntFlag(argv, "--n", 3);
+  const cellFilter = parseCliStringFlag(argv, "--cell");
+  const assumedUsed = parseAssumeUsedArgs(argv);
+  const model = cfg.groqModelReliable;
+
+  const prompts: ReadonlyArray<{ readonly id: PromptVersion; readonly systemPrompt: string }> = [
+    { id: PROMPT_VERSION_V1, systemPrompt: SYSTEM_PROMPT_V1 },
+    { id: PROMPT_VERSION_V2, systemPrompt: SYSTEM_PROMPT_V2 },
+  ];
+  const schemas: ReadonlyArray<{
+    readonly id: ToolSchemaVersion;
+    readonly tools: readonly OpenAiToolDefinition[];
+  }> = [
+    { id: TOOL_SCHEMA_VERSION_V1, tools: VOICE_TOOLS_V1 },
+    { id: TOOL_SCHEMA_VERSION_V2, tools: VOICE_TOOLS_V2 },
+  ];
+  const utterances: ReadonlyArray<{ readonly id: "u1" | "u2"; readonly text: string }> = [
+    { id: "u1", text: TIME_TOOL_PROMPT },
+    { id: "u2", text: TIME_TOOL_PROMPT_V2 },
+  ];
+
+  const allCells = prompts.flatMap((p) =>
+    schemas.flatMap((s) =>
+      utterances.map((u) => ({
+        key: `${p.id}:${s.id}:${u.id}`,
+        promptVersion: p.id,
+        systemPrompt: p.systemPrompt,
+        schemaVersion: s.id,
+        tools: s.tools,
+        utteranceId: u.id,
+        utterance: u.text,
+      })),
+    ),
+  );
+
+  const cells =
+    cellFilter === null ? allCells : allCells.filter((c) => c.key === cellFilter);
+  if (cells.length === 0) {
+    throw new Error(
+      `Unknown --cell '${cellFilter}'. Valid: ${allCells.map((c) => c.key).join(", ")}`,
+    );
+  }
+
+  const maxPlannedLoop = cells.length * nRuns * 2;
+  const tokenBudget = checkGroqTokenBudget(
+    [{ model, plannedRequests: maxPlannedLoop + 1 }],
+    USAGE_LEDGER_PATH,
+    assumedUsed,
+  );
+
+  const groqBase = await measureBaseline("Groq", GROQ_BASE_URL, cfg.groqApiKey);
+  assertModelsPresent("Groq", [model], groqBase.modelIds);
+  const reliableProbe = await probeReasoningSettings(
+    GROQ_BASE_URL,
+    cfg.groqApiKey,
+    model,
+    cfg.groqReliableReasoningEffort ?? "low",
+    true,
+  );
+
+  const plannedMap = new Map<string, number>([["reliable", maxPlannedLoop]]);
+  checkGroqRequestBudget(
+    groqBase.baseline.rateLimitHeaders,
+    [{ role: "reliable", model, probeWithBudget: reliableProbe }],
+    plannedMap,
+    `  Planned C-time diagnosis: ${cells.length} cell(s) x N=${nRuns} x up to 2 reqs = ${maxPlannedLoop} max loop requests`,
+  );
+
+  const instr = createInstrumentedAgent(true);
+  const pacer = new PerModelRatePacer();
+
+  interface CellOutcome {
+    readonly key: string;
+    readonly promptVersion: PromptVersion;
+    readonly schemaVersion: ToolSchemaVersion;
+    readonly utterance: string;
+    readonly n: number;
+    readonly correct: number;
+    readonly streamError: number;
+    readonly noToolCall: number;
+    readonly otherFailures: number;
+    readonly failedGenerations: readonly string[];
+    readonly errorMessages: readonly string[];
+  }
+
+  const results: CellOutcome[] = [];
+
+  try {
+    await listModels(GROQ_BASE_URL, cfg.groqApiKey, instr.agent);
+    for (const cell of cells) {
+      let correct = 0;
+      let streamError = 0;
+      let noToolCall = 0;
+      let otherFailures = 0;
+      const failedGenerations: string[] = [];
+      const errorMessages: string[] = [];
+
+      for (let i = 0; i < nRuns; i += 1) {
+        await pacer.waitForModel(model);
+        const sample = await runToolTurn(
+          cfg.groqApiKey,
+          reliableProbe.probe,
+          instr,
+          cell.utterance,
+          validateCurrentTimeToolCalls,
+          `ctime:${cell.key}[${i}]`,
+          "auto",
+          { systemPrompt: cell.systemPrompt, tools: cell.tools },
+        );
+        pacer.recordRequests(model, sample.connectionReq2 ? 2 : 1, 3200);
+
+        if (sample.passed) {
+          correct += 1;
+        } else if (sample.req1StreamError !== null) {
+          streamError += 1;
+          errorMessages.push(sample.req1StreamError.message);
+          if (sample.req1StreamError.failedGeneration !== null) {
+            failedGenerations.push(sample.req1StreamError.failedGeneration);
+          }
+        } else if (sample.reason === "no_tool_call") {
+          noToolCall += 1;
+        } else {
+          otherFailures += 1;
+        }
+      }
+
+      const cellOutcome: CellOutcome = {
+        key: cell.key,
+        promptVersion: cell.promptVersion,
+        schemaVersion: cell.schemaVersion,
+        utterance: cell.utterance,
+        n: nRuns,
+        correct,
+        streamError,
+        noToolCall,
+        otherFailures,
+        failedGenerations,
+        errorMessages,
+      };
+      results.push(cellOutcome);
+      console.log(
+        `  [${cell.key}] "${cell.utterance}" -> correct=${correct}/${nRuns}, stream_error=${streamError}/${nRuns}, no_tool_call=${noToolCall}/${nRuns}` +
+          (otherFailures > 0 ? `, other=${otherFailures}/${nRuns}` : ""),
+      );
+      if (failedGenerations.length > 0) {
+        for (let idx = 0; idx < failedGenerations.length; idx += 1) {
+          console.log(`    failed_generation[${idx + 1}]: ${failedGenerations[idx]}`);
+        }
+      }
+      if (errorMessages.length > 0) {
+        for (let idx = 0; idx < errorMessages.length; idx += 1) {
+          console.log(`    error_message[${idx + 1}]: ${errorMessages[idx]}`);
+        }
+      }
+    }
+  } finally {
+    await instr.close();
+  }
+
+  mkdirSync(OUT_DIR, { recursive: true });
+  const diagPath = path.join(OUT_DIR, "ctime-diagnosis.json");
+  writeFileSync(
+    diagPath,
+    `${JSON.stringify(
+      {
+        timestamp: new Date().toISOString(),
+        model,
+        nRuns,
+        cellFilter,
+        tokenBudget,
+        cells: results,
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+  console.log(`\nSaved C-time diagnosis results to ${diagPath}`);
+}
+
 async function main(): Promise<void> {
   if (process.argv.includes("--list-models")) {
     await printAvailableModels();
@@ -3041,17 +3324,26 @@ async function main(): Promise<void> {
     await runTask3dExperiment();
     return;
   }
+  if (process.argv.includes("--diagnose-ctime")) {
+    await runCtimeDiagnosis();
+    return;
+  }
 
   loadEnvFromRoot();
   const cfg: SpikeEnvConfig = loadSpikeConfig(process.env);
+  const assumedUsed = parseAssumeUsedArgs(process.argv.slice(2));
 
-  checkGroqTokenBudget([
-    { model: cfg.groqModelFast, plannedRequests: N_RUNS * GROQ_REQUESTS_PER_ITERATION + 2 },
-    { model: cfg.groqModelReliable, plannedRequests: N_RUNS * GROQ_REQUESTS_PER_ITERATION + 2 },
-    ...(cfg.groqModelNoReason
-      ? [{ model: cfg.groqModelNoReason, plannedRequests: N_RUNS * GROQ_REQUESTS_PER_ITERATION + 2 }]
-      : []),
-  ]);
+  checkGroqTokenBudget(
+    [
+      { model: cfg.groqModelFast, plannedRequests: N_RUNS * GROQ_REQUESTS_PER_ITERATION + 2 },
+      { model: cfg.groqModelReliable, plannedRequests: N_RUNS * GROQ_REQUESTS_PER_ITERATION + 2 },
+      ...(cfg.groqModelNoReason
+        ? [{ model: cfg.groqModelNoReason, plannedRequests: N_RUNS * GROQ_REQUESTS_PER_ITERATION + 2 }]
+        : []),
+    ],
+    USAGE_LEDGER_PATH,
+    assumedUsed,
+  );
 
   const groqBase = await measureBaseline("Groq", GROQ_BASE_URL, cfg.groqApiKey);
   console.log(`Groq live models (${groqBase.modelIds.length}): ${groqBase.modelIds.join(", ")}`);

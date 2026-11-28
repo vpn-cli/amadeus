@@ -255,6 +255,20 @@ describe("GroqStreamAccumulator", () => {
       validateCurrentTimeToolCalls([
         {
           index: 0,
+          id: "t2b",
+          type: "function",
+          name: "get_current_time",
+          rawArguments: '{"timezone":null}',
+          parsedArguments: { timezone: null },
+          validJson: true,
+        },
+      ]).passed,
+    ).toBe(true);
+
+    expect(
+      validateCurrentTimeToolCalls([
+        {
+          index: 0,
           id: "t3",
           type: "function",
           name: "get_current_time",
@@ -299,6 +313,60 @@ describe("GroqStreamAccumulator", () => {
         0,
       ),
     ).toBe(false);
+  });
+
+  it("classifies recorded SSE error events (e.g. Groq tool_use_failed) as stream_error, never no_tool_call", () => {
+    const acc = new GroqStreamAccumulator();
+
+    const s1 = acc.pushEventData(
+      JSON.stringify({
+        choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
+      }),
+    );
+    expect(s1.error).toBeNull();
+
+    const s2 = acc.pushEventData(
+      JSON.stringify({
+        choices: [{ index: 0, delta: { reasoning: "We need to call get_current_time." }, finish_reason: null }],
+      }),
+    );
+    expect(s2.error).toBeNull();
+
+    const s3 = acc.pushEventData(
+      JSON.stringify({
+        error: {
+          message:
+            "Tool call validation failed: tool call validation failed: parameters for tool get_current_time did not match schema: errors: [`/timezone`: expected string, but got null]",
+          type: "invalid_request_error",
+          code: "tool_use_failed",
+          failed_generation:
+            '{"name": "get_current_time", "arguments": {\n  "timezone": null\n}}',
+          status_code: 400,
+        },
+      }),
+      "error",
+    );
+    expect(s3.error).toEqual({
+      message:
+        "Tool call validation failed: tool call validation failed: parameters for tool get_current_time did not match schema: errors: [`/timezone`: expected string, but got null]",
+      type: "invalid_request_error",
+      code: "tool_use_failed",
+      failedGeneration:
+        '{"name": "get_current_time", "arguments": {\n  "timezone": null\n}}',
+      statusCode: 400,
+    });
+
+    const res = acc.result();
+    expect(res.streamError).toEqual(s3.error);
+    expect(res.toolCalls).toHaveLength(0);
+    expect(res.usage.totalTokens).toBeNull();
+
+    const validation = validateCurrentTimeToolCalls(res.toolCalls, res.streamError);
+    expect(validation.passed).toBe(false);
+    expect(validation.reason).toMatch(/^stream_error:/);
+    expect(validation.reason).toContain("tool_use_failed");
+    expect(validation.reason).toContain("expected string, but got null");
+    expect(validation.reason).not.toBe("no_tool_call");
   });
 
   it("distinguishes daily TPD/RPD 429 errors from short TPM/RPM bursts", () => {

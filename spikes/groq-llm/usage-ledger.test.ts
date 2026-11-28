@@ -3,7 +3,10 @@ import {
   DEFAULT_TOKENS_PER_REQUEST,
   GROQ_TPD_LIMIT,
   computeModelTokenBudget,
+  estimateMedianTokensForModel,
   evaluateGroqTokenBudgets,
+  getLedgerCoverageInfo,
+  parseAssumeUsedArgs,
   parseUsageLedger,
   type UsageLedgerEntry,
 } from "./usage-ledger.js";
@@ -144,5 +147,64 @@ describe("usage-ledger", () => {
       estimatedTokens: 45_000,
       withinLimit: true,
     });
+  });
+
+  it("round-trips estimated entries, computes median excluding estimated rows, checks <24h coverage, and parses --assume-used", () => {
+    const raw = [
+      JSON.stringify({
+        ts: "2026-11-28T10:00:00.000Z",
+        model: "openai/gpt-oss-120b",
+        prompt_tokens: 300,
+        completion_tokens: 100,
+        total_tokens: 400,
+      }),
+      JSON.stringify({
+        ts: "2026-11-28T10:05:00.000Z",
+        model: "openai/gpt-oss-120b",
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 400,
+        estimated: true,
+      }),
+    ].join("\n");
+
+    const parsed = parseUsageLedger(raw);
+    expect(parsed).toHaveLength(2);
+    expect(parsed[0]?.estimated).toBeUndefined();
+    expect(parsed[1]?.estimated).toBe(true);
+
+    expect(estimateMedianTokensForModel(parsed, "openai/gpt-oss-120b")).toEqual({
+      tokens: 400,
+      source: "ledger_median",
+      samples: 1,
+    });
+
+    const young = getLedgerCoverageInfo(parsed, Date.parse("2026-11-28T14:00:00.000Z"));
+    expect(young.isYoungerThan24h).toBe(true);
+    expect(young.oldestTs).toBe("2026-11-28T10:00:00.000Z");
+
+    const full = getLedgerCoverageInfo(parsed, Date.parse("2026-11-29T10:00:01.000Z"));
+    expect(full.isYoungerThan24h).toBe(false);
+
+    const assumed = parseAssumeUsedArgs([
+      "--diagnose-ctime",
+      "--assume-used",
+      "openai/gpt-oss-120b=50000",
+      "--assume-used=qwen/qwen3.8-27b=120000",
+    ]);
+    expect(assumed.get("openai/gpt-oss-120b")).toBe(50_000);
+    expect(assumed.get("qwen/qwen3.8-27b")).toBe(120_000);
+
+    const budget = computeModelTokenBudget(
+      parsed,
+      "openai/gpt-oss-120b",
+      10,
+      Date.parse("2026-11-28T14:00:00.000Z"),
+      GROQ_TPD_LIMIT,
+      assumed,
+    );
+    expect(budget.usedLast24h).toBe(50_800);
+    expect(budget.assumedUsed).toBe(50_000);
+    expect(budget.projectedTotalTokens).toBe(54_800);
   });
 });

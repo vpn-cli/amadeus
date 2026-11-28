@@ -47,7 +47,7 @@ export const OrderStatusArgsSchema = z.object({
 });
 
 export const CurrentTimeArgsSchema = z.object({
-  timezone: z.string().trim().min(1).optional(),
+  timezone: z.string().trim().min(1).nullish(),
 });
 
 export interface OpenAiToolDefinition {
@@ -105,7 +105,16 @@ export const VOICE_TOOLS_V2: readonly OpenAiToolDefinition[] = [
       name: "get_current_time",
       description:
         "Call whenever the user asks for the current time or date. timezone is optional; omit it to use the user's local timezone (Asia/Kolkata).",
-      parameters: VOICE_TOOLS_V1[1]!.function.parameters,
+      parameters: {
+        type: "object",
+        properties: {
+          timezone: {
+            type: ["string", "null"],
+            description: "Optional IANA timezone name such as 'Asia/Kolkata' or 'UTC'.",
+          },
+        },
+        additionalProperties: false,
+      },
     },
   },
 ];
