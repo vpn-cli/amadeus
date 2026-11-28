@@ -7,10 +7,11 @@ Standalone Node spike validating streaming SSE parsing, split-frame UTF-8/tool-c
 - `sse.ts` — Streaming byte-to-SSE parser handling `Uint8Array` chunk boundaries, multi-byte UTF-8 (`TextDecoder` `{ stream: true }`), `\r\n` / `\n`, multi-line `data:`, and `[DONE]`.
 - `stream-parser.ts` — `GroqStreamAccumulator` tracking content vs `reasoning` deltas (for TTFT excluding reasoning tokens), interleaved multi-chunk tool-call argument assembly, and strict Zod validation (`get_order_status` / `get_current_time`).
 - `sentence-splitter.ts` — Pure streaming sentence chunker splitting on `.`, `!`, `?` while guarding abbreviations (`Dr.`, `U.S.`, `e.g.`), decimals (`3.14`), ellipsis (`...`), and URLs/emails.
-- `config.ts` — Prompts (`PROMPT_VERSION = "voice-v1"`), tool schemas, `models.json` loader with env overrides, and `.env` parser.
+- `config.ts` — Prompts (`voice-v1` and `voice-v2`), tool schemas (`tools-v1` and `tools-v2`), `models.json` loader with env overrides, `--models` filter parser, and `.env` parser.
 - `stats.ts` — Percentile (`median`, `p90`, `min`, `max`) summary helpers.
+- `usage-ledger.ts` — Append-only JSONL token ledger (`out/usage-ledger.jsonl`) and pre-run 24 h TPD (`200,000`) budget check.
 - `models.json` — Selected model IDs (overridable via `.env`).
-- `live.ts` — Interleaved round-robin benchmark harness (`N = 20` per scenario), direct connector socket/DNS/TCP/TLS timing hooks, pre-run per-model request budget check, per-model rate pacing (`2.4 s` Groq / `4.1 s` Gemini), and HTTP `429` retry/backoff.
+- `live.ts` — Interleaved round-robin benchmark harness (`N = 20` per scenario), Task 3c server-timing/qwen diagnosis (`--task3c`), Task 3d `voice-v2` matrix + `queue_time` / `service_tier` harness (`--task3d`, `--models=...`), direct connector socket/DNS/TCP/TLS timing hooks, pre-run RPD & 24 h TPD budget checks, per-model rate pacing, and HTTP `429` retry/backoff.
 
 ## Selected Models (`models.json`)
 
@@ -26,10 +27,11 @@ Copy `.env.example` to `.env` at the repo root and set `GROQ_API_KEY` (plus `GEM
 ```powershell
 pnpm --dir spikes/groq-llm install
 pnpm --dir spikes/groq-llm typecheck
-pnpm --dir spikes/groq-llm test              # 24 pure unit tests (no API keys required)
+pnpm --dir spikes/groq-llm test              # 32 pure unit tests (no API keys required)
 pnpm --dir spikes/groq-llm models            # list active Groq and Gemini models
 pnpm --dir spikes/groq-llm live              # run N=20 interleaved live suite -> out/results.json
 pnpm --dir spikes/groq-llm exec tsx live.ts --task3c  # N=10 server-timing split + qwen tool diagnosis -> out/task3c-results.json
+pnpm --dir spikes/groq-llm task3d -- --models=120b    # N=10 voice-v2 matrix for gpt-oss-120b -> out/task3d-gpt_oss_120b_low-results.json
 ```
 
 ## Live Benchmark Results (2026-11-28, Node `v24.15.0`, India)
@@ -96,6 +98,30 @@ Groq docs classify `qwen/qwen3.8-27b` as a **Preview** model with Local/Remote a
 | `openai/gpt-oss-120b` | D-h2: Cancel H2 (`n=20`) | B-h2: Warm H2 (`450.6 ms`) | `443.7 / 495.3 ms` | `-6.9 ms` | `0.0% (0/20)` | — (reused) | `0` |
 | `qwen/qwen3.8-27b` | D-h1: Cancel H1 (`n=20`) | B: Warm H1 (`169.9 ms`) | `284.9 / 343.8 ms` | `+114.9 ms` | `100.0% (20/20)` | `1.5 / 45.5 / 48.9 ms` | `0` |
 | `qwen/qwen3.8-27b` | D-h2: Cancel H2 (`n=20`) | B-h2: Warm H2 (`176.4 ms`) | `178.6 / 265.1 ms` | `+2.2 ms` | `0.0% (0/20)` | — (reused) | `0` |
+
+### `voice-v2` Prompt Matrix & `queue_time` (`openai/gpt-oss-120b`, `n = 10` per cell, warm H2)
+
+> Pending `qwen/qwen3.8-27b` 200k TPD recovery; `LLM choice` below will be finalized after the `qwen` `voice-v2` run.
+>
+> **Run configuration:** `promptVersion="voice-v2"`, `toolSchemaVersion="tools-v2"`, `tool_choice="auto"`, `reasoning_effort="low"`, `reasoning_format="parsed"`, `N=10` per cell, warm H2 (`out/task3d-gpt_oss_120b_low-results.json`, gitignored). Groq control-plane baseline (`n=10`, `-MAA`, `h1`): edge RTT `43.1 / 52.2 ms`, `/models` RTT `303.7 / 322.3 ms`.
+>
+> **`service_tier` free-tier probes (`openai/gpt-oss-120b`):** `"on_demand"` ALLOWED (`HTTP 200 OK`); `"auto"`, `"flex"`, and `"performance"` all REJECTED (`HTTP 400`, `"service_tier ... is not available for this org"`).
+
+| Prompt (`n = 10`) | Expect Tool | Correct | Wrong / Unwanted Tool | Claimed Check (No Tool) | Pre-Tool Filler | `req1_first_token` med / p90 | `req1_ttft(content)` or `t_toolcall` med | `followup_ttft` med | `e2e` med / p90 | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `C-time`: `"Thanks, what time is it right now?"` | `get_current_time` | `0.0% (0/10)` | `0.0% (0/10)` | `0.0% (0/10)` | `0.0% (0/10)` | `454.7 / 475.7 ms` | `n/a` | `n/a` | `n/a` | `10/10` `no_tool_call`; emitted reasoning token(s) with empty content and no `usage` chunk |
+| `C-order`: `"Can you check the status of my order number one zero four two?"` | `get_order_status` | `100.0% (10/10)` | `0.0% (0/10)` | `0.0% (0/10)` | `0.0% (0/10)` | `460.0 / 473.4 ms` | `t_toolcall 538.5 ms` | `464.8 ms` (`10/10` OK) | `944.0 / 1077.4 ms` | `0/10` pre-tool filler |
+| `Plain`: `"Explain in two short sentences why the sky looks blue during the day."` | `none` | `100.0% (10/10)` | `0.0% (0/10)` | `0.0% (0/10)` | `0.0% (0/10)` | `407.1 / 459.6 ms` | `TTFT 433.8 ms` (`p90 486.6`) | `n/a` | `n/a` | Clean 2-sentence reply |
+| `Near-miss 1`: `"What's a good time of day to call customer support?"` | `none` | `100.0% (10/10)` | `0.0% (0/10)` | `0.0% (0/10)` | `0.0% (0/10)` | `338.3 / 721.0 ms` | `TTFT 369.8 ms` (`p90 755.8`) | `n/a` | `n/a` | Did not misfire `get_current_time` |
+| `Near-miss 2`: `"How long does shipping usually take?"` | `none` | `100.0% (10/10)` | `0.0% (0/10)` | `0.0% (0/10)` | `0.0% (0/10)` | `416.6 / 461.0 ms` | `TTFT 458.1 ms` (`p90 502.7`) | `n/a` | `n/a` | Did not misfire `get_order_status` |
+
+#### `openai/gpt-oss-120b` `queue_time` Distribution (`service_tier="on_demand"`)
+
+| Slice | Count | `min` | `median` | `p90` | `max` |
+| --- | --- | --- | --- | --- | --- |
+| Matrix `Plain` (`n=10`) | `10` | `157.2 ms` | `317.5 ms` | `369.5 ms` | `370.2 ms` |
+| Matrix All `req1` (`C-order` + `Plain` + `Near-miss 1/2`; `C-time` omitted `usage`) | `40` | `156.5 ms` | `318.0 ms` | `371.4 ms` | `613.5 ms` |
+| Matrix All requests (`req1` + `req2`) | `50` | `156.5 ms` | `318.1 ms` | `370.8 ms` | `613.5 ms` |
 
 ## Key Findings for the Voice Pipeline
 
