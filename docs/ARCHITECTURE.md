@@ -34,17 +34,17 @@ Must pass all 10 acceptance criteria from §7 of the spec:
 
 ## 2. Tech Stack & Zero-Cost Guardrails
 
-| Layer | Pick | Why |
+| Layer | Pick | Why (with Phase 0 measured facts) |
 | :--- | :--- | :--- |
 | Language | TypeScript (strict), Node 22+ (tested on Node 24), pnpm workspaces | Shared protocol schemas between client, server, and bench |
 | Server | Fastify + `@fastify/websocket` (`ws`), `pino` logs | Typed routes and structured logs with `session_id` / `turn_id` |
-| Client | Vite + React + Tailwind, AudioWorklets | Lightweight SPA; sample-accurate capture and playback |
-| Server VAD | Silero VAD v6.3 (same ONNX I/O as v5: [1,576] input with 64-sample context, [2,1,128] state, int64 sr) ONNX via `onnxruntime-node` (~120-line wrapper) | Spec requires server-side VAD; `vad-node` is deprecated |
+| Client | Vite + React + Tailwind, AudioWorklets | Native-rate `AudioContext` (`44.1`/`48 kHz`); `?worker&url` (`worker.format: "es"`); zero-gain sink; downmix 2ch→mono in worklet; 63-tap Kaiser FIR (`β=6.5`, cutoff `6,720 Hz`) + Catmull-Rom (`85 dB`/`78 dB` 10 kHz rejection; worst spur `58.8 dB` at 44.1k); WebRTC processing on (`0.86` env NCC, ~10–13 ms shift) / off (`0.9994` waveform NCC) |
+| Server VAD | Silero VAD v6.3 (pinned SHA-256 `f6f4407b...`; ONNX I/O `[1,576]` + 64-sample context, `[2,1,128]` state, `int64` sr) via `onnxruntime-node` | `p50 0.29 ms` / `p95 0.50 ms` per 32 ms window (warm-up excluded); `+1..+46 ms` vs labels; move to worker thread around ~100 sessions |
 | Client VAD | `@ricky0123/vad-web` | Local barge-in detection avoids network RTT before stopping playback |
-| STT (streaming) | Deepgram Nova-3 live WebSocket | Interim results for live captions + `Finalize` for fast final transcript |
-| STT (batch) | Groq `whisper-large-v3-turbo` | Used for initial non-streaming milestone and provider-swap proof |
-| LLM | Groq (OpenAI-compatible API) + Gemini failover | Fast first content token; one `OpenAICompatibleLlm` covers both |
-| TTS | Deepgram Aura-2 over `/v1/speak` WebSocket (REST in M2) | Same vendor/credit pool as STT; supports streaming input (`/v2/speak` rejects Aura models) |
+| STT (streaming) | Deepgram Nova-3 live WebSocket (`wss://api.in.deepgram.com`) | India endpoint: TCP `40 ms`, fresh WS open `171 ms`, `stt_final` (`Finalize→from_finalize`) `80 ms` med / `119 ms` p90 (vs US `api.deepgram.com`: TCP `253 ms`, open `829 ms`, `stt_final` `275 ms`). `linear16` 16 kHz mono, `interim_results`, `smart_format` + numerals (`"one zero four two"` → `"1042"`), `endpointing=false`, `KeepAlive` between turns, pre-warmed per session; confirm burst gives `403 ms` first caption vs `777 ms` real time |
+| STT (batch) | Groq `whisper-large-v3-turbo` (`api.groq.com`, `bom`) | `266 ms` request → transcript, 100% accuracy (swap/fallback adapter; cannot emit partial captions). Free quota: `7,200` audio-s/h, `28,800`/day, `20 RPM`, `2,000 RPD`, `10 s` min billed/req |
+| LLM | Groq OpenAI-compatible API (HTTP/2 `undici` `Agent`) + Gemini failover | Inference in Mumbai (`x-groq-region: bom`, `-MAA` edge, ~90 ms network; `/models` ~300 ms is control-plane only; HTTP/2 avoids `+90–135 ms` H1 abort reconnect). Primary `openai/gpt-oss-120b` (`reasoning=low`, warm H2 TTFT `~447 ms`, ~318 ms queue med); fallback `openai/gpt-oss-20b`; candidate `qwen/qwen3.8-27b` (`~195 ms` TTFT) pending `tools-v3` run; failover `models/gemini-3.5-flash-lite` (`thinking=minimal`, `615–836 ms` TTFT, 1 chunk). Prompt `voice-v2`; `tools-v3` (parameterless `get_current_time`). Free limits: `200k` TPD/model, `1,000` RPD, `8k` TPM, `30` RPM, `on_demand` only |
+| TTS | Deepgram Aura-2 `aura-2-thalia-en` over `wss://api.in.deepgram.com/v1/speak` | `linear16` `24 kHz` mono, 1 pre-warmed socket/call (`184.5 ms` open vs `840.1 ms` US), `tts_first_audio` `107 ms` med (`111 ms` p90) vs `353 ms` US, `Clear→Cleared` `42.5 ms` (`100%` survival), WS `ping` every ~20 s survives `300 s` idle (`{"type":"KeepAlive"}` closes `1008 DATA-0000`), Flush cap `20/60 s` → Flush sentence 1 + end-of-turn; default host stalled `13–23 s` / `30 s` timeout |
 | DB | SQLite (`better-sqlite3`) + Drizzle locally | Zero-setup local persistence (use Supabase Postgres if deployed to ephemeral Render) |
 | Validation | Zod for WS events and env config | Shared runtime + static validation |
 | Tests / CI | Vitest, GitHub Actions | Fast unit + keyless recorded-audio integration tests |
@@ -139,6 +139,8 @@ amadeus/
 
 ## 5. Contracts
 
+> Superseded by docs/DESIGN.md (pending approval).
+
 `packages/protocol/**` and `apps/server/src/adapters/types.ts` are human-owned contracts.
 
 ### 5.1 Audio Formats
@@ -168,6 +170,8 @@ amadeus/
 
 ## 6. Turn Lifecycle & Barge-In
 
+> Superseded by docs/DESIGN.md (pending approval).
+
 - **State Machine (`session/reducer.ts`):**
   - `IDLE` + `START_CALL` → `LISTENING`
   - `LISTENING` + `VAD_START` → `LISTENING` (forward pre-roll audio from `start − 100 ms`, stream frames to STT)
@@ -190,18 +194,22 @@ amadeus/
 
 ## 7. Latency Budget (`performance.now()`)
 
-| Stage | Measurement | Budget |
-| :--- | :--- | :--- |
-| `vad_end_ms` | Last voiced frame arrival → VAD end decision | 576 ms (550 ms hang rounded up to whole 32 ms windows) |
-| `stt_final_ms` | VAD end → final transcript | ≤ 200 ms |
-| `llm_first_token_ms` | Final transcript → first content token | ≤ 350 ms |
-| `first_sentence_ms` | First content token → first chunk sent to TTS | ≤ 80 ms |
-| `tts_first_audio_ms` | First chunk sent to TTS → first `agent_audio` sent | ≤ 250 ms |
-| `total_ms` | Last voiced frame → first `agent_audio` sent | ≤ 1,456 ms |
+Measured Phase 0 medians (server local in India): `576 + 80 + 447 + ≤ 48 + 107 ≈ 1,258 ms` (`openai/gpt-oss-120b`) and `≈ 1,033 ms` (`qwen/qwen3.8-27b`, pending `tools-v3`); tool turns `≈ 1.6 s` (`gpt-oss`) / `≈ 1.35 s` (`qwen`).
+
+| Stage | Measurement | Phase 0 Measured (India) | Spec / Target Budget |
+| :--- | :--- | :--- | :--- |
+| `vad_end_ms` | Last voiced frame arrival → VAD end decision | `576 ms` (18 × 32 ms windows) | `576 ms` (550 ms hang quantized) |
+| `stt_final_ms` | `Finalize` → `from_finalize` (`api.in.deepgram.com`) | `80 ms` med / `119 ms` p90 | `≤ 200 ms` |
+| `llm_first_token_ms` | Final transcript → first content token (H2) | `447 ms` med (`gpt-oss-120b`, ~320 ms queue); `195 ms` (`qwen`); `615–836 ms` (Gemini) | `≤ 450 ms` (spec total ≤ 1.5 s) |
+| `first_sentence_ms` | First content token → first chunk sent to TTS | `18–48 ms` (`gpt-oss`), `~75 ms` (`qwen`) | `≤ 80 ms` |
+| `tts_first_audio_ms` | `Flush` → first `agent_audio` (`api.in.deepgram.com` warm WS) | `107 ms` med / `111 ms` p90 | `≤ 250 ms` |
+| `total_ms` | Last voiced frame → first `agent_audio` sent | `≈ 1,258 ms` med (`gpt-oss-120b`); `≈ 1,033 ms` (`qwen` est.) | `≤ 1,500 ms` (spec) |
 
 ---
 
 ## 8. Error Handling Matrix
+
+> Superseded by docs/DESIGN.md (pending approval).
 
 - **Mic denied:** Request mic permission *before* `POST /sessions` so no orphaned session is created; show banner.
 - **STT error / 1.5 s Finalize timeout:** Play pre-rendered fallback clip (*"Sorry, I didn't catch that, could you repeat?"*); reconnect in background; log error.
@@ -224,12 +232,12 @@ amadeus/
 
 ## 10. Phased Roadmap (Self-Paced)
 
-- **Phase 0 — Spikes (`spikes/`):** Standalone throwaway scripts to isolate each API/runtime before integrating:
-  1. Silero VAD v6.3 (same ONNX I/O as v5: [1,576] input with 64-sample context, [2,1,128] state, int64 sr) ONNX in Node (`onnxruntime-node` + `512 + 64` context + `state`).
-  2. Browser mic capture worklet → WAV download.
-  3. Deepgram Nova-3 live WS transcription of a WAV.
-  4. Groq streaming tokens + 1 tool call.
-  5. Deepgram Aura-2 `/v1/speak` WS → WAV file.
+- **Phase 0 — Spikes (`spikes/`):** Standalone scripts validating each API/runtime before Phase 1:
+  1. `spikes/silero-vad` ✔: Silero VAD v6.3 ONNX in Node (`onnxruntime-node`, `512 + 64` context + `state`, pure segmenter).
+  2. `spikes/browser-capture` ✔: Browser mic capture worklet (`48/44.1 kHz → 16 kHz` Kaiser FIR + Catmull-Rom) + fake-mic E2E capture-to-VAD smoke.
+  3. `spikes/deepgram-stt` ✔: Deepgram Nova-3 live WS (`api.in.deepgram.com`) vs Groq Whisper batch benchmark.
+  4. `spikes/groq-llm` ✔ (`qwen/qwen3.8-27b` `tools-v3` run pending): Groq HTTP/2 streaming, `voice-v2` + `tools-v3`, `gpt-oss-120b`/`20b`, Gemini failover.
+  5. `spikes/deepgram-tts` ✔: Deepgram Aura-2 `/v1/speak` WS (`api.in.deepgram.com`) vs REST, `Clear` survival, idle probe, spoken-form IDs.
 - **Phase 1 — Spec MVP (M1–M4):**
   - M1: pnpm monorepo, TS strict, ESLint import boundary, Vitest, CI, `packages/protocol`, `config.ts`, `POST /sessions` + WS echo, `ping-providers.ts`.
   - M2: Capture/playback worklets, `packages/audio`, Silero + pure segmenter, pure reducer + manager, batch path (Whisper + Groq + Deepgram REST), turn timer, SQLite, `GET /sessions/:id`.
