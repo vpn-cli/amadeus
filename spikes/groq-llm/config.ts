@@ -81,6 +81,8 @@ export type ReasoningEffort = z.infer<typeof ReasoningEffortSchema>;
 export const ModelsFileSchema = z.object({
   groqFast: z.string().trim().min(1).nullable(),
   groqReliable: z.string().trim().min(1).nullable(),
+  GROQ_MODEL_NOREASON: z.string().trim().min(1).nullable().optional(),
+  groqNoReason: z.string().trim().min(1).nullable().optional(),
   gemini: z.string().trim().min(1).nullable(),
 });
 export type ModelsFileConfig = z.infer<typeof ModelsFileSchema>;
@@ -88,6 +90,7 @@ export type ModelsFileConfig = z.infer<typeof ModelsFileSchema>;
 const EMPTY_MODELS: ModelsFileConfig = {
   groqFast: null,
   groqReliable: null,
+  GROQ_MODEL_NOREASON: null,
   gemini: null,
 };
 
@@ -115,8 +118,10 @@ const SpikeApiKeysInputSchema = z.object({
 export interface SpikeEnvConfig extends SpikeApiKeysConfig {
   readonly groqModelFast: string;
   readonly groqModelReliable: string;
+  readonly groqModelNoReason?: string;
   readonly groqFastReasoningEffort?: ReasoningEffort;
   readonly groqReliableReasoningEffort?: ReasoningEffort;
+  readonly groqNoReasonReasoningEffort?: ReasoningEffort;
   readonly geminiModel?: string;
   readonly geminiReasoningEffort?: ReasoningEffort;
 }
@@ -131,8 +136,10 @@ const SpikeEnvInputSchema = z.object({
     .string()
     .trim()
     .min(1, "GROQ_MODEL_RELIABLE is required (set env var or models.json groqReliable)"),
+  GROQ_MODEL_NOREASON: z.string().trim().min(1).optional(),
   GROQ_FAST_REASONING_EFFORT: ReasoningEffortSchema.optional(),
   GROQ_RELIABLE_REASONING_EFFORT: ReasoningEffortSchema.optional(),
+  GROQ_NOREASON_REASONING_EFFORT: ReasoningEffortSchema.optional(),
   GEMINI_API_KEY: z.string().trim().min(1).optional(),
   GEMINI_MODEL: z.string().trim().min(1).optional(),
   GEMINI_REASONING_EFFORT: ReasoningEffortSchema.optional(),
@@ -159,12 +166,15 @@ export function loadSpikeConfig(
   env: Record<string, string | undefined>,
   models: ModelsFileConfig = loadModelsFile(),
 ): SpikeEnvConfig {
+  const noReasonFromFile = models.GROQ_MODEL_NOREASON ?? models.groqNoReason ?? undefined;
   const parsed = SpikeEnvInputSchema.parse({
     GROQ_API_KEY: emptyToUndefined(env.GROQ_API_KEY),
     GROQ_MODEL_FAST: emptyToUndefined(env.GROQ_MODEL_FAST) ?? models.groqFast ?? undefined,
     GROQ_MODEL_RELIABLE: emptyToUndefined(env.GROQ_MODEL_RELIABLE) ?? models.groqReliable ?? undefined,
+    GROQ_MODEL_NOREASON: emptyToUndefined(env.GROQ_MODEL_NOREASON) ?? noReasonFromFile,
     GROQ_FAST_REASONING_EFFORT: emptyToUndefined(env.GROQ_FAST_REASONING_EFFORT),
     GROQ_RELIABLE_REASONING_EFFORT: emptyToUndefined(env.GROQ_RELIABLE_REASONING_EFFORT),
+    GROQ_NOREASON_REASONING_EFFORT: emptyToUndefined(env.GROQ_NOREASON_REASONING_EFFORT),
     GEMINI_API_KEY: emptyToUndefined(env.GEMINI_API_KEY),
     GEMINI_MODEL: emptyToUndefined(env.GEMINI_MODEL) ?? models.gemini ?? undefined,
     GEMINI_REASONING_EFFORT: emptyToUndefined(env.GEMINI_REASONING_EFFORT),
@@ -178,11 +188,17 @@ export function loadSpikeConfig(
     groqApiKey: parsed.GROQ_API_KEY,
     groqModelFast: parsed.GROQ_MODEL_FAST,
     groqModelReliable: parsed.GROQ_MODEL_RELIABLE,
+    ...(parsed.GROQ_MODEL_NOREASON !== undefined
+      ? { groqModelNoReason: parsed.GROQ_MODEL_NOREASON }
+      : {}),
     ...(parsed.GROQ_FAST_REASONING_EFFORT !== undefined
       ? { groqFastReasoningEffort: parsed.GROQ_FAST_REASONING_EFFORT }
       : {}),
     ...(parsed.GROQ_RELIABLE_REASONING_EFFORT !== undefined
       ? { groqReliableReasoningEffort: parsed.GROQ_RELIABLE_REASONING_EFFORT }
+      : {}),
+    ...(parsed.GROQ_NOREASON_REASONING_EFFORT !== undefined
+      ? { groqNoReasonReasoningEffort: parsed.GROQ_NOREASON_REASONING_EFFORT }
       : {}),
     ...(parsed.GEMINI_API_KEY !== undefined ? { geminiApiKey: parsed.GEMINI_API_KEY } : {}),
     ...(parsed.GEMINI_MODEL !== undefined ? { geminiModel: parsed.GEMINI_MODEL } : {}),

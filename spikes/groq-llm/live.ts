@@ -42,10 +42,9 @@ const GROQ_BASE_URL = "https://api.groq.com/openai/v1";
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai";
 
 const N_BASELINE = 10;
-const N_PLAIN = 10;
-const N_TOOL = 20;
-const N_CANCEL = 5;
-const GROQ_PACING_MS = 2100;
+const N_RUNS = 20;
+const GROQ_REQUESTS_PER_ITERATION = 11; // A(1) + B(1) + B-h2(1) + C-time(2) + C-order(2) + D-h1(2) + D-h2(2)
+const GROQ_PACING_MS = 2400; // <= 25 RPM per model (free tier: 30 RPM, 8,000 TPM)
 const GEMINI_PACING_MS = 4100;
 const MAX_RATE_LIMIT_RETRIES = 5;
 
@@ -131,6 +130,25 @@ interface ModelProbeResult {
   readonly reasoningFormat: "parsed" | "default";
 }
 
+interface ModelProbeWithBudget {
+  readonly probe: ModelProbeResult;
+  readonly probeRequestsSpent: number;
+  readonly rateLimitHeaders: Record<string, string>;
+}
+
+interface RequestBudgetEntry {
+  readonly role: string;
+  readonly model: string;
+  readonly plannedLoopRequests: number;
+  readonly probeRequestsSpent: number;
+  readonly totalRequests: number;
+  readonly remainingRequestsSource: "/models" | "/chat/completions" | "unavailable";
+  readonly remainingRequests: number | null;
+  readonly limitRequests: number | null;
+  readonly resetRequests: string | null;
+  readonly enoughForRun: boolean;
+}
+
 interface PlainRunSample {
   readonly ttftMs: number | null;
   readonly firstSentenceAbsMs: number | null;
@@ -194,6 +212,23 @@ type ChatMessage =
       }>;
     }
   | { readonly role: "tool"; readonly tool_call_id: string; readonly content: string };
+
+class PerModelRatePacer {
+  private readonly nextAllowedAt = new Map<string, number>();
+
+  async waitForModel(model: string): Promise<void> {
+    const next = this.nextAllowedAt.get(model);
+    if (next === undefined) return;
+    const delay = next - performance.now();
+    if (delay > 0) {
+      await sleep(delay);
+    }
+  }
+
+  recordRequests(model: string, requestCount: number, pacingMs: number): void {
+    this.nextAllowedAt.set(model, performance.now() + requestCount * pacingMs);
+  }
+}
 
 function loadEnvFromRoot(): void {
   const candidates = [path.join(REPO_ROOT, ".env"), path.join(__dirname, ".env")];
@@ -276,6 +311,7 @@ function createInstrumentedAgent(
 
   const agent = new Agent({
     allowH2,
+    connections: 1,
     connect: instrumentedConnector,
     keepAliveTimeout: 120_000,
     keepAliveMaxTimeout: 300_000,
@@ -759,66 +795,61 @@ async function probeReasoningSettings(
   model: string,
   overrideEffort: ReasoningEffort | undefined,
   allowReasoningFormat: boolean,
-): Promise<ModelProbeResult> {
+): Promise<ModelProbeWithBudget> {
   const instr = createInstrumentedAgent(false);
+  let probeRequestsSpent = 0;
+  let lastHeaders: Record<string, string> = {};
+
+  const doProbe = async (
+    prompt: string,
+    maxTokens: number,
+    reasoningEffort?: ReasoningEffort,
+    reasoningFormat?: "parsed" | "default",
+  ) => {
+    probeRequestsSpent += 1;
+    const outcome = await runStreamingChat({
+      baseUrl,
+      apiKey,
+      model,
+      prompt,
+      tools: undefined,
+      reasoningEffort,
+      reasoningFormat,
+      instr,
+      maxTokens,
+    });
+    if (Object.keys(outcome.rateLimitHeaders).length > 0) {
+      lastHeaders = outcome.rateLimitHeaders;
+    }
+    return outcome;
+  };
+
   try {
     if (overrideEffort !== undefined) {
       let reasoningFormat: "parsed" | "default" = "default";
       if (allowReasoningFormat && overrideEffort !== "none") {
         try {
-          await runStreamingChat({
-            baseUrl,
-            apiKey,
-            model,
-            prompt: "Say ok.",
-            tools: undefined,
-            reasoningEffort: overrideEffort,
-            reasoningFormat: "parsed",
-            instr,
-            maxTokens: 16,
-          });
+          await doProbe("Say ok.", 16, overrideEffort, "parsed");
           reasoningFormat = "parsed";
         } catch {
-          await runStreamingChat({
-            baseUrl,
-            apiKey,
-            model,
-            prompt: "Say ok.",
-            tools: undefined,
-            reasoningEffort: overrideEffort,
-            instr,
-            maxTokens: 16,
-          });
+          await doProbe("Say ok.", 16, overrideEffort, undefined);
         }
       } else {
-        await runStreamingChat({
-          baseUrl,
-          apiKey,
-          model,
-          prompt: "Say ok.",
-          tools: undefined,
-          reasoningEffort: overrideEffort,
-          instr,
-          maxTokens: 16,
-        });
+        await doProbe("Say ok.", 16, overrideEffort, undefined);
       }
       return {
-        model,
-        isReasoningModel: overrideEffort !== "none",
-        reasoningEffort: overrideEffort,
-        reasoningFormat,
+        probe: {
+          model,
+          isReasoningModel: overrideEffort !== "none",
+          reasoningEffort: overrideEffort,
+          reasoningFormat,
+        },
+        probeRequestsSpent,
+        rateLimitHeaders: lastHeaders,
       };
     }
 
-    const defaultProbe = await runStreamingChat({
-      baseUrl,
-      apiKey,
-      model,
-      prompt: "Reply with the word ok.",
-      tools: undefined,
-      instr,
-      maxTokens: 24,
-    });
+    const defaultProbe = await doProbe("Reply with the word ok.", 24);
     const hasReasoning =
       defaultProbe.parsed.reasoningDeltaCount > 0 ||
       (defaultProbe.parsed.usage.reasoningTokens ?? 0) > 0 ||
@@ -828,21 +859,16 @@ async function probeReasoningSettings(
       if (!allowReasoningFormat) {
         for (const effort of ["none", "minimal", "low"] as const) {
           try {
-            await runStreamingChat({
-              baseUrl,
-              apiKey,
-              model,
-              prompt: "Reply with ok.",
-              tools: undefined,
-              reasoningEffort: effort,
-              instr,
-              maxTokens: 16,
-            });
+            await doProbe("Reply with ok.", 16, effort);
             return {
-              model,
-              isReasoningModel: true,
-              reasoningEffort: effort,
-              reasoningFormat: "default",
+              probe: {
+                model,
+                isReasoningModel: true,
+                reasoningEffort: effort,
+                reasoningFormat: "default",
+              },
+              probeRequestsSpent,
+              rateLimitHeaders: lastHeaders,
             };
           } catch {
             // Try next lowest effort tier.
@@ -850,10 +876,14 @@ async function probeReasoningSettings(
         }
       }
       return {
-        model,
-        isReasoningModel: false,
-        reasoningEffort: "not_applicable",
-        reasoningFormat: "default",
+        probe: {
+          model,
+          isReasoningModel: false,
+          reasoningEffort: "not_applicable",
+          reasoningFormat: "default",
+        },
+        probeRequestsSpent,
+        rateLimitHeaders: lastHeaders,
       };
     }
 
@@ -861,43 +891,32 @@ async function probeReasoningSettings(
     for (const effort of efforts) {
       if (allowReasoningFormat && effort !== "none") {
         try {
-          await runStreamingChat({
-            baseUrl,
-            apiKey,
-            model,
-            prompt: "Reply with ok.",
-            tools: undefined,
-            reasoningEffort: effort,
-            reasoningFormat: "parsed",
-            instr,
-            maxTokens: 16,
-          });
+          await doProbe("Reply with ok.", 16, effort, "parsed");
           return {
-            model,
-            isReasoningModel: true,
-            reasoningEffort: effort,
-            reasoningFormat: "parsed",
+            probe: {
+              model,
+              isReasoningModel: true,
+              reasoningEffort: effort,
+              reasoningFormat: "parsed",
+            },
+            probeRequestsSpent,
+            rateLimitHeaders: lastHeaders,
           };
         } catch {
           // Fallback without reasoning_format below.
         }
       }
       try {
-        await runStreamingChat({
-          baseUrl,
-          apiKey,
-          model,
-          prompt: "Reply with ok.",
-          tools: undefined,
-          reasoningEffort: effort,
-          instr,
-          maxTokens: 16,
-        });
+        await doProbe("Reply with ok.", 16, effort);
         return {
-          model,
-          isReasoningModel: effort !== "none",
-          reasoningEffort: effort,
-          reasoningFormat: "default",
+          probe: {
+            model,
+            isReasoningModel: effort !== "none",
+            reasoningEffort: effort,
+            reasoningFormat: "default",
+          },
+          probeRequestsSpent,
+          rateLimitHeaders: lastHeaders,
         };
       } catch {
         // Try next effort tier.
@@ -905,10 +924,14 @@ async function probeReasoningSettings(
     }
 
     return {
-      model,
-      isReasoningModel: true,
-      reasoningEffort: "not_applicable",
-      reasoningFormat: "default",
+      probe: {
+        model,
+        isReasoningModel: true,
+        reasoningEffort: "not_applicable",
+        reasoningFormat: "default",
+      },
+      probeRequestsSpent,
+      rateLimitHeaders: lastHeaders,
     };
   } finally {
     await instr.close();
@@ -1160,258 +1183,146 @@ async function runToolTurn(
   };
 }
 
-async function runCancellationSuite(
-  baseUrl: string,
-  apiKey: string,
-  probe: ModelProbeResult,
-  allowH2: boolean,
-  warmBaselineLabel: string,
-  normalWarmTtftMedian: number | null,
-) {
-  const instr = createInstrumentedAgent(allowH2);
-  try {
-    // Pre-warm agent via /models before running cancellation cycles.
-    await listModels(baseUrl, apiKey, instr.agent);
-    const cycles: CancelCycleSample[] = [];
-    const reasoningEffort =
-      probe.reasoningEffort === "not_applicable" ? undefined : probe.reasoningEffort;
-
-    for (let i = 0; i < N_CANCEL; i += 1) {
-      await sleep(GROQ_PACING_MS * 2);
-      const abortedRun = await runStreamingChat({
-        baseUrl,
-        apiKey,
-        model: probe.model,
-        prompt: PLAIN_PROMPT,
-        tools: VOICE_TOOLS,
-        reasoningEffort,
-        reasoningFormat: probe.reasoningFormat,
-        instr,
-        abortOnFirstContent: true,
-      });
-      assertWarmConnection(`${probe.model}:D-${allowH2 ? "h2" : "h1"}[${i}]:aborted`, abortedRun.connection);
-      if (!abortedRun.aborted) {
-        throw new Error(
-          `Cycle ${i + 1}: stream finished without emitting content before abort`,
-        );
-      }
-      if (abortedRun.deltasAfterAbort > 0) {
-        throw new Error(
-          `Expected 0 deltas after abort, saw ${abortedRun.deltasAfterAbort} on cycle ${i + 1}`,
-        );
-      }
-
-      const agentConnBefore = instr.getConnectCount();
-      const sockConnBefore = instr.getSocketCount();
-      const followUp = await runStreamingChat({
-        baseUrl,
-        apiKey,
-        model: probe.model,
-        prompt: PLAIN_PROMPT,
-        tools: VOICE_TOOLS,
-        reasoningEffort,
-        reasoningFormat: probe.reasoningFormat,
-        instr,
-      });
-
-      cycles.push({
-        abortedTtftMs: abortedRun.ttftMs ?? abortedRun.totalMs,
-        deltasAfterAbort: abortedRun.deltasAfterAbort,
-        postAbortTtftMs: followUp.ttftMs,
-        newAgentConnections: instr.getConnectCount() - agentConnBefore,
-        newSocketConnects: instr.getSocketCount() - sockConnBefore,
-        abortedConnection: abortedRun.connection,
-        followUpConnection: followUp.connection,
-        protocol: followUp.connection.protocol,
-        cfRayLocation: followUp.cfRayLocation,
-      });
-    }
-
-    return summarizeCancelRuns(cycles, warmBaselineLabel, normalWarmTtftMedian);
-  } finally {
-    await instr.close();
-  }
+function toPlainRunSample(res: ChatStreamOutcome): PlainRunSample {
+  return {
+    ttftMs: res.ttftMs,
+    firstSentenceAbsMs: res.firstSentenceAbsMs,
+    firstSentenceRelMs: res.firstSentenceRelMs,
+    totalMs: res.totalMs,
+    reasoningTokens: res.parsed.usage.reasoningTokens ?? 0,
+    wronglyCalledTool: res.parsed.toolCalls.length > 0,
+    connection: res.connection,
+    protocol: res.connection.protocol,
+    cfRayLocation: res.cfRayLocation,
+    rateLimitHeaders: res.rateLimitHeaders,
+  };
 }
 
-async function benchmarkGroqModel(
+async function runSingleCancelCycle(
   apiKey: string,
   probe: ModelProbeResult,
-  originRttMedianMs: number | null,
-) {
+  instr: InstrumentedAgent,
+  allowH2: boolean,
+  iteration: number,
+): Promise<CancelCycleSample> {
   const reasoningEffort =
     probe.reasoningEffort === "not_applicable" ? undefined : probe.reasoningEffort;
 
-  const warmH1Instr = createInstrumentedAgent(false);
-  const warmH2Instr = createInstrumentedAgent(true);
-  const coldRuns: PlainRunSample[] = [];
-  const warmH1Runs: PlainRunSample[] = [];
-  const warmH2Runs: PlainRunSample[] = [];
-  const toolTimeRuns: ToolRunSample[] = [];
-  const toolOrderRuns: ToolRunSample[] = [];
-
-  try {
-    await listModels(GROQ_BASE_URL, apiKey, warmH1Instr.agent);
-    await listModels(GROQ_BASE_URL, apiKey, warmH2Instr.agent);
-
-    for (let i = 0; i < N_PLAIN; i += 1) {
-      const coldInstr = createInstrumentedAgent(false, { disableSessionCache: true });
-      try {
-        const coldRes = await runStreamingChat({
-          baseUrl: GROQ_BASE_URL,
-          apiKey,
-          model: probe.model,
-          prompt: PLAIN_PROMPT,
-          tools: VOICE_TOOLS,
-          reasoningEffort,
-          reasoningFormat: probe.reasoningFormat,
-          instr: coldInstr,
-        });
-        assertColdConnection(`${probe.model}:A[${i}]`, coldRes.connection);
-        coldRuns.push({
-          ttftMs: coldRes.ttftMs,
-          firstSentenceAbsMs: coldRes.firstSentenceAbsMs,
-          firstSentenceRelMs: coldRes.firstSentenceRelMs,
-          totalMs: coldRes.totalMs,
-          reasoningTokens: coldRes.parsed.usage.reasoningTokens ?? 0,
-          wronglyCalledTool: coldRes.parsed.toolCalls.length > 0,
-          connection: coldRes.connection,
-          protocol: coldRes.connection.protocol,
-          cfRayLocation: coldRes.cfRayLocation,
-          rateLimitHeaders: coldRes.rateLimitHeaders,
-        });
-      } finally {
-        await coldInstr.close();
-      }
-      await sleep(GROQ_PACING_MS);
-
-      const warmH1Res = await runStreamingChat({
-        baseUrl: GROQ_BASE_URL,
-        apiKey,
-        model: probe.model,
-        prompt: PLAIN_PROMPT,
-        tools: VOICE_TOOLS,
-        reasoningEffort,
-        reasoningFormat: probe.reasoningFormat,
-        instr: warmH1Instr,
-      });
-      assertWarmConnection(`${probe.model}:B-h1[${i}]`, warmH1Res.connection);
-      warmH1Runs.push({
-        ttftMs: warmH1Res.ttftMs,
-        firstSentenceAbsMs: warmH1Res.firstSentenceAbsMs,
-        firstSentenceRelMs: warmH1Res.firstSentenceRelMs,
-        totalMs: warmH1Res.totalMs,
-        reasoningTokens: warmH1Res.parsed.usage.reasoningTokens ?? 0,
-        wronglyCalledTool: warmH1Res.parsed.toolCalls.length > 0,
-        connection: warmH1Res.connection,
-        protocol: warmH1Res.connection.protocol,
-        cfRayLocation: warmH1Res.cfRayLocation,
-        rateLimitHeaders: warmH1Res.rateLimitHeaders,
-      });
-      await sleep(GROQ_PACING_MS);
-
-      const warmH2Res = await runStreamingChat({
-        baseUrl: GROQ_BASE_URL,
-        apiKey,
-        model: probe.model,
-        prompt: PLAIN_PROMPT,
-        tools: VOICE_TOOLS,
-        reasoningEffort,
-        reasoningFormat: probe.reasoningFormat,
-        instr: warmH2Instr,
-      });
-      assertWarmConnection(`${probe.model}:B-h2[${i}]`, warmH2Res.connection);
-      warmH2Runs.push({
-        ttftMs: warmH2Res.ttftMs,
-        firstSentenceAbsMs: warmH2Res.firstSentenceAbsMs,
-        firstSentenceRelMs: warmH2Res.firstSentenceRelMs,
-        totalMs: warmH2Res.totalMs,
-        reasoningTokens: warmH2Res.parsed.usage.reasoningTokens ?? 0,
-        wronglyCalledTool: warmH2Res.parsed.toolCalls.length > 0,
-        connection: warmH2Res.connection,
-        protocol: warmH2Res.connection.protocol,
-        cfRayLocation: warmH2Res.cfRayLocation,
-        rateLimitHeaders: warmH2Res.rateLimitHeaders,
-      });
-      await sleep(GROQ_PACING_MS);
-    }
-
-    for (let i = 0; i < N_TOOL; i += 1) {
-      toolTimeRuns.push(
-        await runToolTurn(
-          apiKey,
-          probe,
-          warmH1Instr,
-          TIME_TOOL_PROMPT,
-          validateCurrentTimeToolCalls,
-          `${probe.model}:C-time[${i}]`,
-        ),
-      );
-      await sleep(GROQ_PACING_MS * 2);
-
-      toolOrderRuns.push(
-        await runToolTurn(
-          apiKey,
-          probe,
-          warmH1Instr,
-          ORDER_TOOL_PROMPT,
-          validateOrderStatusToolCalls,
-          `${probe.model}:C-order[${i}]`,
-        ),
-      );
-      await sleep(GROQ_PACING_MS * 2);
-    }
-  } finally {
-    await warmH1Instr.close();
-    await warmH2Instr.close();
+  const abortedRun = await runStreamingChat({
+    baseUrl: GROQ_BASE_URL,
+    apiKey,
+    model: probe.model,
+    prompt: PLAIN_PROMPT,
+    tools: VOICE_TOOLS,
+    reasoningEffort,
+    reasoningFormat: probe.reasoningFormat,
+    instr,
+    abortOnFirstContent: true,
+  });
+  assertWarmConnection(
+    `${probe.model}:D-${allowH2 ? "h2" : "h1"}[${iteration}]:aborted`,
+    abortedRun.connection,
+  );
+  if (!abortedRun.aborted) {
+    throw new Error(
+      `${probe.model} D-${allowH2 ? "h2" : "h1"} cycle ${iteration + 1}: stream finished without emitting content before abort`,
+    );
+  }
+  if (abortedRun.deltasAfterAbort > 0) {
+    throw new Error(
+      `${probe.model} D-${allowH2 ? "h2" : "h1"} cycle ${iteration + 1}: expected 0 deltas after abort, saw ${abortedRun.deltasAfterAbort}`,
+    );
   }
 
-  const coldSummary = summarizePlainRuns(coldRuns);
-  const warmSummary = summarizePlainRuns(warmH1Runs);
-  const warmH2Summary = summarizePlainRuns(warmH2Runs);
+  const agentConnBefore = instr.getConnectCount();
+  const sockConnBefore = instr.getSocketCount();
+  const followUp = await runStreamingChat({
+    baseUrl: GROQ_BASE_URL,
+    apiKey,
+    model: probe.model,
+    prompt: PLAIN_PROMPT,
+    tools: VOICE_TOOLS,
+    reasoningEffort,
+    reasoningFormat: probe.reasoningFormat,
+    instr,
+  });
+
+  // Yield briefly so undici returns the finished HTTP/1.1 keep-alive socket before the next iteration.
+  await sleep(25);
+
+  return {
+    abortedTtftMs: abortedRun.ttftMs ?? abortedRun.totalMs,
+    deltasAfterAbort: abortedRun.deltasAfterAbort,
+    postAbortTtftMs: followUp.ttftMs,
+    newAgentConnections: instr.getConnectCount() - agentConnBefore,
+    newSocketConnects: instr.getSocketCount() - sockConnBefore,
+    abortedConnection: abortedRun.connection,
+    followUpConnection: followUp.connection,
+    protocol: followUp.connection.protocol,
+    cfRayLocation: followUp.cfRayLocation,
+  };
+}
+
+interface GroqCandidateSpec {
+  readonly role: "fast" | "reliable" | "noreason";
+  readonly model: string;
+  readonly probeWithBudget: ModelProbeWithBudget;
+}
+
+interface ModelBuckets {
+  readonly coldRuns: PlainRunSample[];
+  readonly warmH1Runs: PlainRunSample[];
+  readonly warmH2Runs: PlainRunSample[];
+  readonly toolTimeRuns: ToolRunSample[];
+  readonly toolOrderRuns: ToolRunSample[];
+  readonly cancelH1Runs: CancelCycleSample[];
+  readonly cancelH2Runs: CancelCycleSample[];
+}
+
+function buildGroqModelReport(
+  probe: ModelProbeResult,
+  buckets: ModelBuckets,
+  originRttMedianMs: number | null,
+) {
+  const coldSummary = summarizePlainRuns(buckets.coldRuns);
+  const warmSummary = summarizePlainRuns(buckets.warmH1Runs);
+  const warmH2Summary = summarizePlainRuns(buckets.warmH2Runs);
   const toolTimeSummary = summarizeToolRuns(
     "time",
     TIME_TOOL_PROMPT,
     "get_current_time",
-    toolTimeRuns,
+    buckets.toolTimeRuns,
   );
   const toolOrderSummary = summarizeToolRuns(
     "order",
     ORDER_TOOL_PROMPT,
     "get_order_status",
-    toolOrderRuns,
+    buckets.toolOrderRuns,
   );
-  const cancelH1 = await runCancellationSuite(
-    GROQ_BASE_URL,
-    apiKey,
-    probe,
-    false,
+  const cancelH1 = summarizeCancelRuns(
+    buckets.cancelH1Runs,
     "B: Warm H1",
     warmSummary.ttftMs.median,
   );
-  const cancelH2 = await runCancellationSuite(
-    GROQ_BASE_URL,
-    apiKey,
-    probe,
-    true,
+  const cancelH2 = summarizeCancelRuns(
+    buckets.cancelH2Runs,
     "B-h2: Warm H2",
     warmH2Summary.ttftMs.median,
   );
 
-  const estimatedModelTimeMs = {
-    h1Ms:
-      warmSummary.ttftMs.median !== null && originRttMedianMs !== null
-        ? warmSummary.ttftMs.median - originRttMedianMs
-        : null,
-    h2Ms:
-      warmH2Summary.ttftMs.median !== null && originRttMedianMs !== null
-        ? warmH2Summary.ttftMs.median - originRttMedianMs
-        : null,
-    originRttMedianMs,
-  };
-
   return {
     settings: probe,
-    estimatedModelTimeMs,
+    estimatedModelTimeMs: {
+      h1Ms:
+        warmSummary.ttftMs.median !== null && originRttMedianMs !== null
+          ? warmSummary.ttftMs.median - originRttMedianMs
+          : null,
+      h2Ms:
+        warmH2Summary.ttftMs.median !== null && originRttMedianMs !== null
+          ? warmH2Summary.ttftMs.median - originRttMedianMs
+          : null,
+      originRttMedianMs,
+    },
     scenarioA_cold: coldSummary,
     scenarioB_warm: warmSummary,
     scenarioB_warmH2: warmH2Summary,
@@ -1420,6 +1331,183 @@ async function benchmarkGroqModel(
     scenarioD_cancelH1: cancelH1,
     scenarioD_cancelH2: cancelH2,
   };
+}
+
+async function runInterleavedGroqSuite(
+  apiKey: string,
+  candidates: readonly GroqCandidateSpec[],
+  originRttMedianMs: number | null,
+) {
+  const warmH1Instr = createInstrumentedAgent(false);
+  const warmH2Instr = createInstrumentedAgent(true);
+  const cancelH2Instr = createInstrumentedAgent(true);
+  const pacer = new PerModelRatePacer();
+
+  const bucketsByRole = new Map<string, ModelBuckets>();
+  for (const c of candidates) {
+    bucketsByRole.set(c.role, {
+      coldRuns: [],
+      warmH1Runs: [],
+      warmH2Runs: [],
+      toolTimeRuns: [],
+      toolOrderRuns: [],
+      cancelH1Runs: [],
+      cancelH2Runs: [],
+    });
+  }
+
+  try {
+    await listModels(GROQ_BASE_URL, apiKey, warmH1Instr.agent);
+    await listModels(GROQ_BASE_URL, apiKey, warmH2Instr.agent);
+    await listModels(GROQ_BASE_URL, apiKey, cancelH2Instr.agent);
+
+    for (let i = 0; i < N_RUNS; i += 1) {
+      const iterStart = performance.now();
+
+      // Scenario A: Cold (h1, fresh Agent + disabled TLS session cache per request)
+      for (const c of candidates) {
+        const probe = c.probeWithBudget.probe;
+        const reasoningEffort =
+          probe.reasoningEffort === "not_applicable" ? undefined : probe.reasoningEffort;
+        await pacer.waitForModel(c.model);
+        const coldInstr = createInstrumentedAgent(false, { disableSessionCache: true });
+        try {
+          const coldRes = await runStreamingChat({
+            baseUrl: GROQ_BASE_URL,
+            apiKey,
+            model: probe.model,
+            prompt: PLAIN_PROMPT,
+            tools: VOICE_TOOLS,
+            reasoningEffort,
+            reasoningFormat: probe.reasoningFormat,
+            instr: coldInstr,
+          });
+          assertColdConnection(`${probe.model}:A[${i}]`, coldRes.connection);
+          bucketsByRole.get(c.role)?.coldRuns.push(toPlainRunSample(coldRes));
+        } finally {
+          await coldInstr.close();
+        }
+        pacer.recordRequests(c.model, 1, GROQ_PACING_MS);
+      }
+
+      // Scenario B: Warm H1
+      for (const c of candidates) {
+        const probe = c.probeWithBudget.probe;
+        const reasoningEffort =
+          probe.reasoningEffort === "not_applicable" ? undefined : probe.reasoningEffort;
+        await pacer.waitForModel(c.model);
+        const warmH1Res = await runStreamingChat({
+          baseUrl: GROQ_BASE_URL,
+          apiKey,
+          model: probe.model,
+          prompt: PLAIN_PROMPT,
+          tools: VOICE_TOOLS,
+          reasoningEffort,
+          reasoningFormat: probe.reasoningFormat,
+          instr: warmH1Instr,
+        });
+        assertWarmConnection(`${probe.model}:B-h1[${i}]`, warmH1Res.connection);
+        bucketsByRole.get(c.role)?.warmH1Runs.push(toPlainRunSample(warmH1Res));
+        pacer.recordRequests(c.model, 1, GROQ_PACING_MS);
+      }
+
+      // Scenario B-h2: Warm H2
+      for (const c of candidates) {
+        const probe = c.probeWithBudget.probe;
+        const reasoningEffort =
+          probe.reasoningEffort === "not_applicable" ? undefined : probe.reasoningEffort;
+        await pacer.waitForModel(c.model);
+        const warmH2Res = await runStreamingChat({
+          baseUrl: GROQ_BASE_URL,
+          apiKey,
+          model: probe.model,
+          prompt: PLAIN_PROMPT,
+          tools: VOICE_TOOLS,
+          reasoningEffort,
+          reasoningFormat: probe.reasoningFormat,
+          instr: warmH2Instr,
+        });
+        assertWarmConnection(`${probe.model}:B-h2[${i}]`, warmH2Res.connection);
+        bucketsByRole.get(c.role)?.warmH2Runs.push(toPlainRunSample(warmH2Res));
+        pacer.recordRequests(c.model, 1, GROQ_PACING_MS);
+      }
+
+      // Scenario C (time): "What time is it?" -> get_current_time + follow-up
+      for (const c of candidates) {
+        const probe = c.probeWithBudget.probe;
+        await pacer.waitForModel(c.model);
+        const sample = await runToolTurn(
+          apiKey,
+          probe,
+          warmH1Instr,
+          TIME_TOOL_PROMPT,
+          validateCurrentTimeToolCalls,
+          `${probe.model}:C-time[${i}]`,
+        );
+        bucketsByRole.get(c.role)?.toolTimeRuns.push(sample);
+        pacer.recordRequests(c.model, sample.connectionReq2 ? 2 : 1, GROQ_PACING_MS);
+      }
+
+      // Scenario C (order): "order one zero four two" -> get_order_status + follow-up
+      for (const c of candidates) {
+        const probe = c.probeWithBudget.probe;
+        await pacer.waitForModel(c.model);
+        const sample = await runToolTurn(
+          apiKey,
+          probe,
+          warmH1Instr,
+          ORDER_TOOL_PROMPT,
+          validateOrderStatusToolCalls,
+          `${probe.model}:C-order[${i}]`,
+        );
+        bucketsByRole.get(c.role)?.toolOrderRuns.push(sample);
+        pacer.recordRequests(c.model, sample.connectionReq2 ? 2 : 1, GROQ_PACING_MS);
+      }
+
+      // Scenario D-h1: Cancel H1 (fresh pre-warmed Agent per cycle so abort teardown doesn't pollute next cycle)
+      for (const c of candidates) {
+        const probe = c.probeWithBudget.probe;
+        await pacer.waitForModel(c.model);
+        const cancelH1Instr = createInstrumentedAgent(false);
+        try {
+          await listModels(GROQ_BASE_URL, apiKey, cancelH1Instr.agent);
+          const sample = await runSingleCancelCycle(apiKey, probe, cancelH1Instr, false, i);
+          bucketsByRole.get(c.role)?.cancelH1Runs.push(sample);
+        } finally {
+          await cancelH1Instr.close();
+        }
+        pacer.recordRequests(c.model, 2, GROQ_PACING_MS);
+      }
+
+      // Scenario D-h2: Cancel H2
+      for (const c of candidates) {
+        const probe = c.probeWithBudget.probe;
+        await pacer.waitForModel(c.model);
+        const sample = await runSingleCancelCycle(apiKey, probe, cancelH2Instr, true, i);
+        bucketsByRole.get(c.role)?.cancelH2Runs.push(sample);
+        pacer.recordRequests(c.model, 2, GROQ_PACING_MS);
+      }
+
+      const elapsedSec = ((performance.now() - iterStart) / 1000).toFixed(1);
+      console.log(
+        `[RoundRobin] completed iteration ${i + 1}/${N_RUNS} across ${candidates.length} Groq models in ${elapsedSec} s`,
+      );
+    }
+  } finally {
+    await Promise.all([
+      warmH1Instr.close(),
+      warmH2Instr.close(),
+      cancelH2Instr.close(),
+    ]);
+  }
+
+  const reports = new Map<string, ReturnType<typeof buildGroqModelReport>>();
+  for (const c of candidates) {
+    const buckets = bucketsByRole.get(c.role);
+    if (!buckets) continue;
+    reports.set(c.role, buildGroqModelReport(c.probeWithBudget.probe, buckets, originRttMedianMs));
+  }
+  return reports;
 }
 
 async function benchmarkGeminiScenarioB(
@@ -1434,7 +1522,7 @@ async function benchmarkGeminiScenarioB(
 
   try {
     await listModels(GEMINI_BASE_URL, apiKey, instr.agent);
-    for (let i = 0; i < N_PLAIN; i += 1) {
+    for (let i = 0; i < N_RUNS; i += 1) {
       const res = await runStreamingChat({
         baseUrl: GEMINI_BASE_URL,
         apiKey,
@@ -1445,19 +1533,8 @@ async function benchmarkGeminiScenarioB(
         instr,
       });
       assertWarmConnection(`${probe.model}:B-h1[${i}]`, res.connection);
-      runs.push({
-        ttftMs: res.ttftMs,
-        firstSentenceAbsMs: res.firstSentenceAbsMs,
-        firstSentenceRelMs: res.firstSentenceRelMs,
-        totalMs: res.totalMs,
-        reasoningTokens: res.parsed.usage.reasoningTokens ?? 0,
-        wronglyCalledTool: res.parsed.toolCalls.length > 0,
-        connection: res.connection,
-        protocol: res.connection.protocol,
-        cfRayLocation: res.cfRayLocation,
-        rateLimitHeaders: res.rateLimitHeaders,
-      });
-      if (i + 1 < N_PLAIN) {
+      runs.push(toPlainRunSample(res));
+      if (i + 1 < N_RUNS) {
         await sleep(GEMINI_PACING_MS);
       }
     }
@@ -1477,6 +1554,87 @@ async function benchmarkGeminiScenarioB(
     },
     scenarioB_warm: warmSummary,
   };
+}
+
+function checkGroqRequestBudget(
+  modelsBaselineHeaders: Record<string, string>,
+  candidates: readonly GroqCandidateSpec[],
+): {
+  readonly modelsEndpointHasRateLimitHeaders: boolean;
+  readonly entries: readonly RequestBudgetEntry[];
+} {
+  const modelsEndpointRemainingRaw = modelsBaselineHeaders["x-ratelimit-remaining-requests"];
+  const modelsEndpointHasRateLimitHeaders = modelsEndpointRemainingRaw !== undefined;
+  const plannedLoopRequests = N_RUNS * GROQ_REQUESTS_PER_ITERATION;
+
+  console.log("\n=== Groq Request Budget Check ===");
+  console.log(
+    `  /models x-ratelimit-remaining-requests: ${modelsEndpointRemainingRaw ?? "not returned by Groq GET /models (per-model limits are returned on POST /chat/completions)"}`,
+  );
+  console.log(
+    `  Planned per Groq model: N=${N_RUNS} x ${GROQ_REQUESTS_PER_ITERATION} req/iter ` +
+      `(A=1, B=1, B-h2=1, C-time=2, C-order=2, D-h1=2, D-h2=2) = ${plannedLoopRequests} loop requests`,
+  );
+
+  const entries: RequestBudgetEntry[] = [];
+  const insufficient: RequestBudgetEntry[] = [];
+
+  for (const c of candidates) {
+    const hdrs = c.probeWithBudget.rateLimitHeaders;
+    const remStr = modelsEndpointRemainingRaw ?? hdrs["x-ratelimit-remaining-requests"];
+    const limStr = hdrs["x-ratelimit-limit-requests"];
+    const resetStr = hdrs["x-ratelimit-reset-requests"] ?? null;
+    const remainingRequests =
+      remStr !== undefined && /^\d+$/.test(remStr) ? Number(remStr) : null;
+    const limitRequests =
+      limStr !== undefined && /^\d+$/.test(limStr) ? Number(limStr) : null;
+    const remainingRequestsSource: RequestBudgetEntry["remainingRequestsSource"] =
+      modelsEndpointRemainingRaw !== undefined
+        ? "/models"
+        : remStr !== undefined
+          ? "/chat/completions"
+          : "unavailable";
+    const enoughForRun =
+      remainingRequests !== null && remainingRequests >= plannedLoopRequests;
+
+    const entry: RequestBudgetEntry = {
+      role: c.role,
+      model: c.model,
+      plannedLoopRequests,
+      probeRequestsSpent: c.probeWithBudget.probeRequestsSpent,
+      totalRequests: plannedLoopRequests + c.probeWithBudget.probeRequestsSpent,
+      remainingRequestsSource,
+      remainingRequests,
+      limitRequests,
+      resetRequests: resetStr,
+      enoughForRun,
+    };
+    entries.push(entry);
+
+    console.log(
+      `  [${c.role.toUpperCase()}] ${c.model}: loop=${plannedLoopRequests}, probe=${c.probeWithBudget.probeRequestsSpent}, ` +
+        `total=${entry.totalRequests} | remaining=${remainingRequests ?? "unknown"}/${limitRequests ?? "?"} ` +
+        `(source=${remainingRequestsSource}, reset=${resetStr ?? "n/a"}) -> ${enoughForRun ? "OK" : "STOP"}`,
+    );
+
+    if (!enoughForRun) {
+      insufficient.push(entry);
+    }
+  }
+
+  if (insufficient.length > 0) {
+    const detail = insufficient
+      .map(
+        (e) =>
+          `${e.model}: needs ${e.plannedLoopRequests} loop requests, remaining=${e.remainingRequests ?? "unknown"} (reset=${e.resetRequests ?? "unknown"})`,
+      )
+      .join("; ");
+    throw new Error(
+      `Insufficient daily request budget for N=${N_RUNS} (refusing to silently lower N): ${detail}`,
+    );
+  }
+
+  return { modelsEndpointHasRateLimitHeaders, entries };
 }
 
 function formatConnectionLine(c: ReturnType<typeof summarizeConnectionMetrics>): string {
@@ -1535,7 +1693,10 @@ function printToolSummary(label: string, c: ReturnType<typeof summarizeToolRuns>
   }
 }
 
-function printModelReport(role: string, report: Awaited<ReturnType<typeof benchmarkGroqModel>>): void {
+function printModelReport(
+  role: string,
+  report: ReturnType<typeof buildGroqModelReport>,
+): void {
   console.log(
     `\n=== Groq [${role}] model=${report.settings.model} reasoning=${report.settings.reasoningEffort} format=${report.settings.reasoningFormat} ===`,
   );
@@ -1623,7 +1784,13 @@ async function main(): Promise<void> {
 
   const groqBase = await measureBaseline("Groq", GROQ_BASE_URL, cfg.groqApiKey);
   console.log(`Groq live models (${groqBase.modelIds.length}): ${groqBase.modelIds.join(", ")}`);
-  assertModelsPresent("Groq", [cfg.groqModelFast, cfg.groqModelReliable], groqBase.modelIds);
+
+  const requestedGroqModels = [
+    cfg.groqModelFast,
+    cfg.groqModelReliable,
+    ...(cfg.groqModelNoReason ? [cfg.groqModelNoReason] : []),
+  ];
+  assertModelsPresent("Groq", requestedGroqModels, groqBase.modelIds);
 
   const fastProbe = await probeReasoningSettings(
     GROQ_BASE_URL,
@@ -1640,16 +1807,42 @@ async function main(): Promise<void> {
     true,
   );
 
+  const groqCandidates: GroqCandidateSpec[] = [
+    { role: "fast", model: cfg.groqModelFast, probeWithBudget: fastProbe },
+    { role: "reliable", model: cfg.groqModelReliable, probeWithBudget: reliableProbe },
+  ];
+
+  if (cfg.groqModelNoReason) {
+    const noReasonProbe = await probeReasoningSettings(
+      GROQ_BASE_URL,
+      cfg.groqApiKey,
+      cfg.groqModelNoReason,
+      cfg.groqNoReasonReasoningEffort ?? "none",
+      true,
+    );
+    groqCandidates.push({
+      role: "noreason",
+      model: cfg.groqModelNoReason,
+      probeWithBudget: noReasonProbe,
+    });
+  }
+
+  const budget = checkGroqRequestBudget(groqBase.baseline.rateLimitHeaders, groqCandidates);
+
   const groqOriginRttMedian = groqBase.baseline.originRttMs.median;
-  const fastReport = await benchmarkGroqModel(cfg.groqApiKey, fastProbe, groqOriginRttMedian);
-  const reliableReport = await benchmarkGroqModel(
+  const groqReports = await runInterleavedGroqSuite(
     cfg.groqApiKey,
-    reliableProbe,
+    groqCandidates,
     groqOriginRttMedian,
   );
 
-  printModelReport("FAST", fastReport);
-  printModelReport("RELIABLE", reliableReport);
+  const fastReport = groqReports.get("fast");
+  const reliableReport = groqReports.get("reliable");
+  const noReasonReport = groqReports.get("noreason") ?? null;
+
+  if (fastReport) printModelReport("FAST", fastReport);
+  if (reliableReport) printModelReport("RELIABLE", reliableReport);
+  if (noReasonReport) printModelReport("NOREASON", noReasonReport);
 
   let geminiBaseline: HostBaseline | null = null;
   let geminiModels: string[] = [];
@@ -1669,9 +1862,10 @@ async function main(): Promise<void> {
       cfg.geminiReasoningEffort,
       false,
     );
+    console.log(`\n[Budget] Gemini ${cfg.geminiModel}: plannedLoop=${N_RUNS} (Scenario B warm)`);
     geminiReport = await benchmarkGeminiScenarioB(
       cfg.geminiApiKey,
-      gemProbe,
+      gemProbe.probe,
       gemBase.baseline.originRttMs.median,
     );
     console.log(
@@ -1689,6 +1883,9 @@ async function main(): Promise<void> {
     nodeVersion: process.version,
     promptVersion: PROMPT_VERSION,
     systemPrompt: SYSTEM_PROMPT,
+    sampleSizeN: N_RUNS,
+    interleavedRoundRobin: true,
+    budget,
     baselines: {
       groq: groqBase.baseline,
       gemini: geminiBaseline,
@@ -1698,8 +1895,9 @@ async function main(): Promise<void> {
       gemini: geminiModels,
     },
     groq: {
-      fast: fastReport,
-      reliable: reliableReport,
+      fast: fastReport ?? null,
+      reliable: reliableReport ?? null,
+      noreason: noReasonReport,
     },
     gemini: geminiReport,
   };

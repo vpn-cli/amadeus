@@ -14,12 +14,14 @@ import {
 const NULL_MODELS: ModelsFileConfig = {
   groqFast: null,
   groqReliable: null,
+  GROQ_MODEL_NOREASON: null,
   gemini: null,
 };
 
 const POPULATED_MODELS: ModelsFileConfig = {
   groqFast: "file-fast-model",
   groqReliable: "file-reliable-model",
+  GROQ_MODEL_NOREASON: "file-noreason-model",
   gemini: "file-gemini-model",
 };
 
@@ -38,7 +40,12 @@ describe("config", () => {
 
   it("loads valid models.json schema from disk", () => {
     const models = loadModelsFile(DEFAULT_MODELS_PATH);
-    expect(Object.keys(models).sort()).toEqual(["gemini", "groqFast", "groqReliable"]);
+    expect(Object.keys(models).sort()).toEqual([
+      "GROQ_MODEL_NOREASON",
+      "gemini",
+      "groqFast",
+      "groqReliable",
+    ]);
   });
 
   it("requires GROQ_API_KEY and both Groq model IDs when models.json has nulls", () => {
@@ -80,6 +87,7 @@ describe("config", () => {
       groqApiKey: "gsk_test",
       groqModelFast: "file-fast-model",
       groqModelReliable: "file-reliable-model",
+      groqModelNoReason: "file-noreason-model",
       geminiApiKey: "AIza_test",
       geminiModel: "file-gemini-model",
     });
@@ -89,6 +97,8 @@ describe("config", () => {
         GROQ_API_KEY: "gsk_test",
         GROQ_MODEL_FAST: "env-fast-model",
         GROQ_MODEL_RELIABLE: "   ",
+        GROQ_MODEL_NOREASON: "env-noreason-model",
+        GROQ_NOREASON_REASONING_EFFORT: "none",
         GEMINI_API_KEY: "AIza_test",
         GEMINI_MODEL: "env-gemini-model",
       },
@@ -96,6 +106,8 @@ describe("config", () => {
     );
     expect(overridden.groqModelFast).toBe("env-fast-model");
     expect(overridden.groqModelReliable).toBe("file-reliable-model");
+    expect(overridden.groqModelNoReason).toBe("env-noreason-model");
+    expect(overridden.groqNoReasonReasoningEffort).toBe("none");
     expect(overridden.geminiModel).toBe("env-gemini-model");
   });
 
