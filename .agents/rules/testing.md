@@ -7,7 +7,7 @@ description: "Apply when writing, modifying, or reviewing unit tests, integratio
 
 - **Zero API keys in tests:** No unit or integration test may make real network calls or require `.env` provider keys.
 - **Unit tests (Vitest):**
-  - `session/reducer.ts`: table-driven tests covering every state transition row in `docs/ARCHITECTURE.md` §6.
+  - `session/reducer.ts`: table-driven tests covering every state transition row in `docs/DESIGN.md` §3.3.
   - `pipeline/chunker.ts`: write tests first covering decimals (`3.5`), abbreviations (`Dr.`, `e.g.`, `etc.`, `no.`), first-clause flush (`, ; :` at ≥ 40 chars), markdown stripping, and end-of-stream flush.
   - `vad/segmenter.ts`: test against synthetic probability sequences (no ONNX runtime required).
   - Barge-in truncation: verify `played_ms` → `spoken_text` mapping.
