@@ -265,6 +265,7 @@ export class DeepgramTtsWsSession {
   private metadata: DeepgramTtsMetadataMessage | null = null;
   private readonly sessionNotices: ClassifiedServerNotice[] = [];
   private closed = false;
+  private desynced = false;
   private closeCode: number | null = null;
   private closeReason = "";
   private closeResolve!: (summary: DeepgramTtsCloseSummary) => void;
@@ -433,7 +434,7 @@ export class DeepgramTtsWsSession {
   }
 
   get isOpen(): boolean {
-    return !this.closed && this.ws.readyState === WebSocket.OPEN;
+    return !this.closed && !this.desynced && this.ws.readyState === WebSocket.OPEN;
   }
 
   getMetadata(): DeepgramTtsMetadataMessage | null {
@@ -461,7 +462,7 @@ export class DeepgramTtsWsSession {
       throw new Error("Deepgram TTS WebSocket closed while waiting for flush budget");
     }
 
-    const timeoutMs = options.turnTimeoutMs ?? 15_000;
+    const timeoutMs = options.turnTimeoutMs ?? 30_000;
     const chunks: AudioChunkTiming[] = [];
     const buffers: Buffer[] = [];
     const notices: ClassifiedServerNotice[] = [];
@@ -486,6 +487,7 @@ export class DeepgramTtsWsSession {
 
       const timer = setTimeout(() => {
         timedOut = true;
+        this.desynced = true;
         finish();
       }, timeoutMs);
 
@@ -592,6 +594,7 @@ export class DeepgramTtsWsSession {
 
       const timer = setTimeout(() => {
         timedOut = true;
+        this.desynced = true;
         finish();
       }, timeoutMs);
 
@@ -684,7 +687,7 @@ export class DeepgramTtsWsSession {
 
     const clearDelayMs = options.clearAfterFirstAudioMs ?? 40;
     const drainMs = options.postClearDrainMs ?? 150;
-    const timeoutMs = options.turnTimeoutMs ?? 15_000;
+    const timeoutMs = options.turnTimeoutMs ?? 30_000;
 
     const sm = new TtsTurnStateMachine();
     const notices: ClassifiedServerNotice[] = [];

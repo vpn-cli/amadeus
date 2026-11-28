@@ -177,8 +177,33 @@ describe("ws-client", () => {
     clock += 100;
     expect(await limiter.waitAndReserve(1)).toBe(0);
     // 4th flush must wait until oldest timestamp (0) expires at 1000 + 25
-    const waited = await limiter.waitAndReserve(1);
-    expect(waited).toBeGreaterThan(0);
+    expect(await limiter.waitAndReserve(1)).toBeGreaterThan(0);
     expect(sleeps.length).toBe(1);
+  });
+
+  it("marks socket desynced on turn timeout to prevent stale-frame reuse", async () => {
+    await withMockWsServer(
+      (ws) => {
+        ws.on("message", (data, isBinary) => {
+          if (isBinary) return;
+          const msg = JSON.parse(data.toString()) as { type: string };
+          if (msg.type === "Close") {
+            ws.close(1000, "Done");
+          }
+          // Deliberately never send Flushed
+        });
+      },
+      async (port) => {
+        const session = await DeepgramTtsWsSession.connect(
+          `ws://127.0.0.1:${port}/v1/speak`,
+          "test_key",
+        );
+        const res = await session.synthesizeTurn({ text: "Timeout test.", turnTimeoutMs: 40 });
+        expect(res.timedOut).toBe(true);
+        expect(session.isOpen).toBe(false);
+        await expect(session.synthesizeTurn({ text: "Next." })).rejects.toThrow();
+        await session.closeGracefully();
+      },
+    );
   });
 });
