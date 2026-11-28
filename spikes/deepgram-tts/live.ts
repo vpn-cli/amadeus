@@ -305,16 +305,65 @@ async function runIdleLifetimeProbe(apiKey: string, model: string, maxWaitMs: nu
   console.log(`Active resources after idle probe: ${JSON.stringify(process.getActiveResourcesInfo())}`);
 }
 
+const SPOKEN_ID_PHRASES: readonly { readonly file: string; readonly text: string }[] = [
+  { file: "order-1042-spoken-words-in-ws.wav", text: "Your order one zero four two has shipped." },
+  { file: "order-1042-spaced-digits-in-ws.wav", text: "Your order 1 0 4 2 has shipped." },
+  { file: "order-1042-ten-forty-two-in-ws.wav", text: "Your order ten forty-two has shipped." },
+];
+
+async function runSpokenIdCheck(apiKey: string, model: string, maxChars: number): Promise<void> {
+  const hostSpec = DEEPGRAM_TTS_HOSTS.find((h) => h.id === "in");
+  if (!hostSpec) {
+    throw new Error("India host spec (id='in') not found");
+  }
+  const plannedChars = SPOKEN_ID_PHRASES.reduce((acc, p) => acc + p.text.length, 0);
+  const budget = evaluateTtsCharBudget(plannedChars, maxChars);
+  console.log("=== Deepgram Aura-2 TTS — Spoken-Form ID WAV Check ===");
+  console.log(
+    `Host: ${hostSpec.host} | Model: ${model} | Phrases: ${SPOKEN_ID_PHRASES.length} | Total planned: ${budget.plannedChars} chars (limit=${budget.maxChars}, est=$${budget.estimatedUsd.toFixed(4)})`,
+  );
+  if (!budget.ok) {
+    console.error(`ABORT: ${budget.reason}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  mkdirSync(OUT_DIR, { recursive: true });
+  const wsUrl = buildDeepgramSpeakWsUrl(hostSpec.host, { model });
+  const sess = await DeepgramTtsWsSession.connect(wsUrl, apiKey);
+  try {
+    for (const phrase of SPOKEN_ID_PHRASES) {
+      const turn = await sess.synthesizeTurn({ text: phrase.text });
+      const fmt = checkRawPcm24kFormat(turn.pcmBytes, phrase.text);
+      const wavPath = path.join(OUT_DIR, phrase.file);
+      if (turn.pcmBytes.byteLength > 0) {
+        await writePcm16Wav(wavPath, turn.pcmBytes);
+      }
+      console.log(
+        `  Saved ${path.relative(REPO_ROOT, wavPath).replace(/\\/g, "/")} (${phrase.text.length} chars, ${fmt.durationMs.toFixed(0)} ms, flush->1st=${formatMs(turn.flushToFirstAudioMs)}, ok=${fmt.ok}, notices=${turn.notices.length}): "${phrase.text}"`,
+      );
+    }
+  } finally {
+    await sess.closeGracefully();
+  }
+  console.log(`Active resources after spoken-id-check: ${JSON.stringify(process.getActiveResourcesInfo())}`);
+}
+
 async function main(): Promise<void> {
   loadEnvFromRoot();
   const cfg = loadTtsSpikeConfig(process.env);
   const argv = process.argv.slice(2);
   const isIdleProbe = hasCliFlag(argv, "--idle-probe");
+  const isSpokenIdCheck = hasCliFlag(argv, "--spoken-id-check");
   const isSmoke = hasCliFlag(argv, "--smoke");
 
   if (isIdleProbe) {
     const maxWaitMs = parseCliIntFlag(argv, "--idle-ms", IDLE_PROBE_5MIN_MS);
     await runIdleLifetimeProbe(cfg.deepgramApiKey, cfg.ttsModel, maxWaitMs);
+    return;
+  }
+  if (isSpokenIdCheck) {
+    await runSpokenIdCheck(cfg.deepgramApiKey, cfg.ttsModel, cfg.maxChars);
     return;
   }
 

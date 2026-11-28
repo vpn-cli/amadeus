@@ -24,6 +24,7 @@ pnpm --dir spikes/deepgram-tts exec vitest run --reporter=verbose   # 26 unit te
 pnpm --dir spikes/deepgram-tts live                                  # N=10 interleaved WS & REST -> out/results.json + out/*.wav
 pnpm --dir spikes/deepgram-tts live -- --smoke                       # N=1 India-only smoke run (~850 chars) -> out/smoke-results.json
 pnpm --dir spikes/deepgram-tts live -- --idle-probe                  # 0 chars: 5-min idle hold on api.in.deepgram.com (WS ping / 20 s)
+pnpm --dir spikes/deepgram-tts live -- --spoken-id-check             # 109 chars: spoken-form ID WAVs on api.in.deepgram.com
 ```
 
 ## Live Benchmark Results (2026-11-28, Node `v24.15.0`, India, `aura-2-thalia-en`)
@@ -88,6 +89,14 @@ pnpm --dir spikes/deepgram-tts live -- --idle-probe                  # 0 chars: 
 
 - All `160/160` synthesized WS & REST streams passed `checkRawPcm24kFormat` (`0` `RIFF` headers, `0` odd-byte buffers, `160/160` plausible duration).
 - Saved WAVs in `spikes/deepgram-tts/out/` (gitignored): `order-1042-in-ws.wav` (`2920 ms`), `long-20w-in-ws.wav` (`6600 ms`), `order-1042-default-ws.wav` (`2840 ms`), `long-20w-default-ws.wav` (`6160 ms`), `order-1042-in-rest.wav` (`2880 ms`), `order-1042-default-rest.wav` (`2920 ms`), `time-345pm-in-ws.wav` (`2440 ms`), `time-345pm-default-ws.wav` (`2480 ms`).
+- **Spoken-form order ID WAVs (`--spoken-id-check`, `api.in.deepgram.com`, `109` chars total):**
+  - `order-1042-spoken-words-in-ws.wav` (`2360 ms`, `flush->1st=101.5 ms`): `"Your order one zero four two has shipped."`
+  - `order-1042-spaced-digits-in-ws.wav` (`2800 ms`, `flush->1st=106.1 ms`): `"Your order 1 0 4 2 has shipped."`
+  - `order-1042-ten-forty-two-in-ws.wav` (`2280 ms`, `flush->1st=106.3 ms`): `"Your order ten forty-two has shipped."`
+- **Deepgram TTS text-normalization & pronunciation docs:**
+  - **Text-normalization API flag:** none found for Aura-2 (`/v1/speak`). (`normalize_volume` in [`tts-voice-controls`](https://developers.deepgram.com/docs/tts-voice-controls) is audio loudness normalization on Flux TTS `/v2/speak` only — `Not supported` on Aura-2. [`improving-aura-2-formatting`](https://developers.deepgram.com/docs/improving-aura-2-formatting) and [`text-to-speech-prompting`](https://developers.deepgram.com/docs/text-to-speech-prompting) rely on formatting the input text itself.)
+  - **Pronunciation option:** Aura-2 (`/v1/speak`) supports per-word inline IPA overrides (`\{"word": "...", "pronounce": "..."\}`), documented in [`tts-voice-controls`](https://developers.deepgram.com/docs/tts-voice-controls):
+    > "Deepgram Aura-2 (`/v1/speak`) supports speed and pronunciation with the same syntax." ... "Pronunciation overrides are specified inline within the text using escaped JSON objects: `\{"word": "dupilumab", "pronounce": "duːˈpɪljuːmæb"\}`" ... "**Aura-2** pronunciation control is generally available, with the same syntax and limits and a maximum input text length of 2000 characters. On Aura-2, place the stress mark directly before the vowel (`duːpˈɪljuːmæb`); a stress mark before a consonant returns a pronunciation warning."
 
 ## Phase 1 design constraints
 
@@ -114,3 +123,6 @@ pnpm --dir spikes/deepgram-tts live -- --idle-probe                  # 0 chars: 
      - Opening a fresh socket per turn adds **`184.5 ms` med / `295.2 ms` p90** on `api.in.deepgram.com` (`840.1 / 1607.1 ms` on `api.deepgram.com`), erasing WS's `~70–94 ms` latency lead over REST and eating `~185 ms` of our `<= 1,500 ms` turn budget.
      - Reusing one pre-warmed socket per call delivers **`107.0 ms` med (`111.1 ms` p90)** `tts_first_audio`, `0/20` reconnects, **`>= 300 s`** idle survival on `api.in.deepgram.com` with 20 s WS `ping` (never `{"type":"KeepAlive"}`), and **`100%` (`10/10`) survival after `Clear`** (`42.5 ms` `Clear -> Cleared`, `101.3 ms` next-turn audio).
      - Flushing **only sentence 1 immediately** (for minimal `tts_first_audio`) and **once at LLM stream end** uses **1–2 Flushes per turn** (`10–20` turns/min on one socket), staying safely below `20 Flushes / 60 s` while keeping `J = 60–100 ms` client jitter buffering at `0/60` underruns.
+
+5. **Spoken-form normalization for IDs vs captions:**
+   - Captions keep the original text; TTS receives a spoken form. A deterministic normalizer rewrites known IDs (values from tool calls, e.g. `order_id`) and `'order/#' + digits` into spoken digits before TTS. Barge-in `played_ms` → heard-text mapping must use the spoken text and map back to caption text.
