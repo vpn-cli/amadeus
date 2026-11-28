@@ -60,6 +60,13 @@ import {
   type ToolValidationResult,
 } from "./stream-parser.js";
 import {
+  DailyQuotaError,
+  exitCodeForStopReason,
+  serializeTask3dResults,
+  writeJsonFileAtomic,
+  type Task3dStopReason,
+} from "./task3d-results.js";
+import {
   GROQ_TPD_LIMIT,
   appendUsageLedgerEntry,
   estimateMedianTokensForModel,
@@ -702,9 +709,7 @@ async function runStreamingChat(opts: ChatRequestOptions): Promise<ChatStreamOut
     }
     const errText = await res.text();
     if (isDailyRateLimitBody(errText)) {
-      throw new Error(
-        `Daily quota exhausted on ${opts.model} (429): ${errText}`,
-      );
+      throw new DailyQuotaError(opts.model, errText);
     }
     if (attempt === MAX_RATE_LIMIT_RETRIES) {
       throw new Error(
@@ -2577,6 +2582,9 @@ async function probeGroqServiceTiers(
         }
         probes.push({ tier, allowed: true, detail: "HTTP 200 OK" });
       } catch (err) {
+        if (err instanceof DailyQuotaError) {
+          throw err;
+        }
         const msg = err instanceof Error ? err.message : String(err);
         probes.push({ tier, allowed: false, detail: msg });
       }
@@ -2836,6 +2844,112 @@ async function runTask3dExperiment(): Promise<void> {
     serviceTierRuns.set(tier, []);
   }
 
+  const outPath =
+    selectedIds.length === TASK3D_MODEL_IDS.length
+      ? TASK3D_RESULTS_PATH
+      : path.join(OUT_DIR, `task3d-${selectedIds.join("-")}-results.json`);
+
+  const buildSnapshotData = () => {
+    const cellSummaries = modelSpecs.flatMap((m) =>
+      promptSpecs.map((p) => summarizeTask3dCell(m, p, cellBuckets.get(`${m.id}:${p.id}`) ?? [])),
+    );
+
+    let queueTime120b: {
+      readonly matrixPlain: DistributionStats;
+      readonly matrixAllReq1: DistributionStats;
+      readonly matrixAllRequests: DistributionStats;
+    } | null = null;
+    let serviceTierSummaries: Array<{
+      readonly tier: GroqServiceTier;
+      readonly summary: ReturnType<typeof summarizePlainRuns>;
+    }> = [];
+
+    if (run120b) {
+      const reliablePlainQueueTimes = (cellBuckets.get("gpt_oss_120b_low:plain") ?? [])
+        .map((r) => r.req1ServerQueueMs)
+        .filter((v): v is number => v !== null);
+      const reliableAllReq1QueueTimes = promptSpecs
+        .flatMap((p) => cellBuckets.get(`gpt_oss_120b_low:${p.id}`) ?? [])
+        .map((r) => r.req1ServerQueueMs)
+        .filter((v): v is number => v !== null);
+      const reliableAllReqQueueTimes = promptSpecs
+        .flatMap((p) => cellBuckets.get(`gpt_oss_120b_low:${p.id}`) ?? [])
+        .flatMap((r) => [r.req1ServerQueueMs, r.req2ServerQueueMs])
+        .filter((v): v is number => v !== null);
+
+      queueTime120b = {
+        matrixPlain: summarize(reliablePlainQueueTimes),
+        matrixAllReq1: summarize(reliableAllReq1QueueTimes),
+        matrixAllRequests: summarize(reliableAllReqQueueTimes),
+      };
+
+      serviceTierSummaries = tiersToBenchmark.map((tier) => ({
+        tier,
+        summary: summarizePlainRuns(serviceTierRuns.get(tier) ?? []),
+      }));
+    }
+
+    return {
+      cellSummaries,
+      queueTime120b,
+      serviceTierSummaries,
+    };
+  };
+
+  const writeTask3dSnapshot = (stopReason: Task3dStopReason | null) => {
+    const { cellSummaries, queueTime120b, serviceTierSummaries } = buildSnapshotData();
+    const payload = serializeTask3dResults(
+      {
+        timestamp: new Date().toISOString(),
+        nodeVersion: process.version,
+        selectedModels: selectedIds,
+        promptVersion: PROMPT_VERSION_V2,
+        toolSchemaVersion: TOOL_SCHEMA_VERSION_V3,
+        comparisonBaseline: {
+          promptVersion: PROMPT_VERSION,
+          toolSchemaVersion: TOOL_SCHEMA_VERSION_V1,
+        },
+        systemPrompt: SYSTEM_PROMPT_V2,
+        tools: VOICE_TOOLS_V3,
+        nTask3d: N_TASK3D,
+        plannedRequestCounts: {
+          qwenPlannedMax,
+          reliableMatrixPlannedMax,
+          serviceTierPlannedReqs,
+          reliableTotalPlannedMax,
+          grandTotalPlannedMax,
+        },
+        tokenBudget,
+        budget,
+        baselines: {
+          groqControlPlane: groqBase.baseline,
+        },
+        matrixCells: cellSummaries,
+        queueTime120b,
+        serviceTierCheck: run120b
+          ? {
+              probes: tierProbeResult.probes,
+              allowedTiers,
+              results: serviceTierSummaries,
+            }
+          : null,
+      },
+      stopReason,
+    );
+    writeJsonFileAtomic(outPath, payload);
+  };
+
+  let terminalStopWritten = false;
+  const onSigint = (): void => {
+    if (!terminalStopWritten) {
+      terminalStopWritten = true;
+      writeTask3dSnapshot("sigint");
+      console.error(`\n[Task3d] SIGINT received; saved partial results to ${outPath} (stop_reason="sigint")`);
+    }
+    process.exit(exitCodeForStopReason("sigint"));
+  };
+  process.once("SIGINT", onSigint);
+
   try {
     await listModels(GROQ_BASE_URL, cfg.groqApiKey, warmH2Instr.agent);
 
@@ -2888,6 +3002,7 @@ async function runTask3dExperiment(): Promise<void> {
               groqRegion: toolSample.groqRegion,
               cfRayLocation: toolSample.cfRayLocation,
             });
+            writeTask3dSnapshot(null);
             pacer.recordRequests(m.model, toolSample.connectionReq2 ? 2 : 1, m.pacingMs);
           } else {
             const res = await runStreamingChat({
@@ -2939,6 +3054,7 @@ async function runTask3dExperiment(): Promise<void> {
               groqRegion: res.groqRegion,
               cfRayLocation: res.cfRayLocation,
             });
+            writeTask3dSnapshot(null);
             pacer.recordRequests(m.model, 1, m.pacingMs);
           }
         }
@@ -2970,66 +3086,54 @@ async function runTask3dExperiment(): Promise<void> {
           });
           assertWarmConnection(`3d:service_tier=${tier}[${i}]`, res.connection);
           serviceTierRuns.get(tier)?.push(toPlainRunSample(res));
+          writeTask3dSnapshot(null);
           pacer.recordRequests(reliableModel, 1, 2500);
         }
         console.log(`[Task3d:ServiceTier] completed iteration ${i + 1}/${N_TASK3D}`);
       }
     }
+  } catch (err) {
+    if (err instanceof DailyQuotaError) {
+      if (!terminalStopWritten) {
+        terminalStopWritten = true;
+        writeTask3dSnapshot("daily_quota");
+        console.error(
+          `\n[Task3d] Daily quota 429; saved partial results to ${outPath} (stop_reason="daily_quota")`,
+        );
+      }
+      process.exitCode = exitCodeForStopReason("daily_quota");
+    }
+    throw err;
   } finally {
+    process.off("SIGINT", onSigint);
     await warmH2Instr.close();
+  }
+
+  if (!terminalStopWritten) {
+    terminalStopWritten = true;
+    writeTask3dSnapshot("complete");
   }
 
   console.log(
     `\n=== Task 3d Matrix Results (prompt=${PROMPT_VERSION_V2}, toolSchema=${TOOL_SCHEMA_VERSION_V3}, tool_choice=auto, warm H2, N=${N_TASK3D}, models=${selectedIds.join(",")}) ===`,
   );
-  const cellSummaries: Array<ReturnType<typeof summarizeTask3dCell>> = [];
+  const { cellSummaries, queueTime120b, serviceTierSummaries } = buildSnapshotData();
   for (const m of modelSpecs) {
     console.log(`\n--- ${m.label} ---`);
     for (const p of promptSpecs) {
-      const summary = summarizeTask3dCell(m, p, cellBuckets.get(`${m.id}:${p.id}`) ?? []);
-      cellSummaries.push(summary);
-      printTask3dCellSummary(summary);
+      const summary = cellSummaries.find((c) => c.modelId === m.id && c.promptId === p.id);
+      if (summary) {
+        printTask3dCellSummary(summary);
+      }
     }
   }
 
-  // Part 3a: queue_time min/median/p90/max for openai/gpt-oss-120b runs.
-  let queueTime120b: {
-    readonly matrixPlain: DistributionStats;
-    readonly matrixAllReq1: DistributionStats;
-    readonly matrixAllRequests: DistributionStats;
-  } | null = null;
-  let serviceTierSummaries: Array<{
-    readonly tier: GroqServiceTier;
-    readonly summary: ReturnType<typeof summarizePlainRuns>;
-  }> = [];
-
-  if (run120b) {
-    const reliablePlainQueueTimes = (cellBuckets.get("gpt_oss_120b_low:plain") ?? [])
-      .map((r) => r.req1ServerQueueMs)
-      .filter((v): v is number => v !== null);
-    const reliableAllReq1QueueTimes = promptSpecs
-      .flatMap((p) => cellBuckets.get(`gpt_oss_120b_low:${p.id}`) ?? [])
-      .map((r) => r.req1ServerQueueMs)
-      .filter((v): v is number => v !== null);
-    const reliableAllReqQueueTimes = promptSpecs
-      .flatMap((p) => cellBuckets.get(`gpt_oss_120b_low:${p.id}`) ?? [])
-      .flatMap((r) => [r.req1ServerQueueMs, r.req2ServerQueueMs])
-      .filter((v): v is number => v !== null);
-
-    const queueStatsPlain = summarize(reliablePlainQueueTimes);
-    const queueStatsAllReq1 = summarize(reliableAllReq1QueueTimes);
-    const queueStatsAllReqs = summarize(reliableAllReqQueueTimes);
-    queueTime120b = {
-      matrixPlain: queueStatsPlain,
-      matrixAllReq1: queueStatsAllReq1,
-      matrixAllRequests: queueStatsAllReqs,
-    };
-
+  if (run120b && queueTime120b) {
     console.log(`\n=== Task 3d Part 3a: ${reliableModel} queue_time distribution ===`);
     for (const [label, q] of [
-      ["Matrix Plain (n=10)", queueStatsPlain],
-      ["Matrix All req1 (5 prompts x 10)", queueStatsAllReq1],
-      ["Matrix All requests (req1 + req2)", queueStatsAllReqs],
+      ["Matrix Plain (n=10)", queueTime120b.matrixPlain],
+      ["Matrix All req1 (5 prompts x 10)", queueTime120b.matrixAllReq1],
+      ["Matrix All requests (req1 + req2)", queueTime120b.matrixAllRequests],
     ] as const) {
       console.log(
         `  ${label} (count=${q.count}): min=${formatMs(q.min)} | median=${formatMs(q.median)} | p90=${formatMs(q.p90)} | max=${formatMs(q.max)}`,
@@ -3042,62 +3146,16 @@ async function runTask3dExperiment(): Promise<void> {
         "  Skipped extra service_tier loop: Groq free tier only accepts default service_tier=\"on_demand\" (auto, flex, performance returned HTTP 400).",
       );
     }
-    serviceTierSummaries = tiersToBenchmark.map((tier) => {
-      const s = summarizePlainRuns(serviceTierRuns.get(tier) ?? []);
+    for (const { tier, summary: s } of serviceTierSummaries) {
       console.log(
         `  service_tier="${tier}" (n=${s.n}): ` +
           `queue_time min=${formatMs(s.serverTimings.queueTimeMs.min)} med=${formatMs(s.serverTimings.queueTimeMs.median)} p90=${formatMs(s.serverTimings.queueTimeMs.p90)} max=${formatMs(s.serverTimings.queueTimeMs.max)} | ` +
           `TTFT(content) med=${formatMs(s.ttftMs.median)} p90=${formatMs(s.ttftMs.p90)} | ` +
           `FirstToken(any) med=${formatMs(s.firstAnyTokenMs.median)} p90=${formatMs(s.firstAnyTokenMs.p90)}`,
       );
-      return {
-        tier,
-        summary: s,
-      };
-    });
+    }
   }
 
-  mkdirSync(OUT_DIR, { recursive: true });
-  const payload = {
-    timestamp: new Date().toISOString(),
-    nodeVersion: process.version,
-    selectedModels: selectedIds,
-    promptVersion: PROMPT_VERSION_V2,
-    toolSchemaVersion: TOOL_SCHEMA_VERSION_V3,
-    comparisonBaseline: {
-      promptVersion: PROMPT_VERSION,
-      toolSchemaVersion: TOOL_SCHEMA_VERSION_V1,
-    },
-    systemPrompt: SYSTEM_PROMPT_V2,
-    tools: VOICE_TOOLS_V3,
-    nTask3d: N_TASK3D,
-    plannedRequestCounts: {
-      qwenPlannedMax,
-      reliableMatrixPlannedMax,
-      serviceTierPlannedReqs,
-      reliableTotalPlannedMax,
-      grandTotalPlannedMax,
-    },
-    tokenBudget,
-    budget,
-    baselines: {
-      groqControlPlane: groqBase.baseline,
-    },
-    matrixCells: cellSummaries,
-    queueTime120b,
-    serviceTierCheck: run120b
-      ? {
-          probes: tierProbeResult.probes,
-          allowedTiers,
-          results: serviceTierSummaries,
-        }
-      : null,
-  };
-  const outPath =
-    selectedIds.length === TASK3D_MODEL_IDS.length
-      ? TASK3D_RESULTS_PATH
-      : path.join(OUT_DIR, `task3d-${selectedIds.join("-")}-results.json`);
-  writeFileSync(outPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
   console.log(`\nSaved Task 3d results to ${outPath}`);
 }
 
